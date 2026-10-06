@@ -82,6 +82,10 @@ static volatile int g_stop_sampling = 0;
 // 平台层自己的诊断开关。不要引用插件入口的全局变量（自检不编 core.cpp，会链接失败）。
 static volatile int g_ps_debug = 0;
 
+// 诊断计数器：用来区分"信号没送到"和"处理器跑了但没找到槽位"
+static volatile long g_handler_runs = 0;   // 处理器一共进了多少次
+static volatile long g_handler_miss = 0;   // 进了处理器但窗口内没有 state==1 的槽位
+
 //----------------------------------------------------------------------------------------
 // 信号处理器
 //----------------------------------------------------------------------------------------
@@ -104,14 +108,17 @@ static int slot_window_base() {
 }
 
 // 信号处理器里怎么知道该写哪个槽位？
-// 不靠全局变量，而是直接扫描本线程的那一份槽位表，找第一个"已投递"的槽位。
-// 本线程同一时刻最多只有一个请求在飞（sample_tid_range 是严格串行的），所以不会认错。
-// 另外：采样线程自己屏蔽了这个信号，所以处理器不可能在"等待中"的线程上重入。
+// 分两步：先看"发起采样的线程"自己的私有窗口，找不到再用 CAS 认领全表任意
+// state==1 的槽位（应对"进程里有多份本文件副本"的情况，详见下面第 2 步的注释）。
+// 采样线程同一时刻最多只有一个请求在飞（sample_tid_range 严格串行），所以不会认错。
 void ps_signal_handler(int, siginfo_t *, void *vctx) {
+    __atomic_add_fetch(&g_handler_runs, 1, __ATOMIC_RELAXED);
     ucontext_t *uc = (ucontext_t *)vctx;
     unsigned long ip = PS_UC_IP(uc);
-    // 只扫"采样线程"的窗口（g_slot_window 是 thread_local，
-    // 而处理器运行在采样线程上，所以这里读到的正是发起者的窗口）
+
+    // 1) 先在"发起采样的那个线程"的私有窗口里找待回填的槽位。
+    //    g_slot_window 是 thread_local，而处理器运行在发起采样的线程上，
+    //    所以这里读到的正是发起者的窗口（绝大多数情况走这条）。
     int base = g_slot_window < 0 ? 0 : g_slot_window;
     int end = base + kSlotsPerThread;
     if (end > kMaxSlots) end = kMaxSlots;
@@ -122,7 +129,30 @@ void ps_signal_handler(int, siginfo_t *, void *vctx) {
             return;
         }
     }
-    // 没有在等回填的槽位：说明这个信号不是我们这一轮投递的（理论上不该发生），丢掉即可
+
+    // 2) 退路：扫全表，用原子操作认领任意 state==1 的槽位。
+    //
+    // 【为什么必须有这条退路】同一个进程里可能存在【多份本文件的副本】——
+    // 例如 perfstat_srv.so 里一份、离线自检程序里一份。信号处理器是进程级的、
+    // 后装的会覆盖先装的，而 g_slots / g_slot_window 却是每份副本各自的。
+    // 于是会出现"处理器是 A 副本的，但发起采样的是 B 副本"的情况：
+    // A 的处理器只看 A 的窗口（里面什么都没有），B 的槽位永远等不到回填，
+    // 表现就是每次采样都卡满 20ms 超时、一个样本都拿不到。
+    //
+    // 用 CAS 认领：只有把 state 从 1 抢到 3 的那个处理器才写 ip，
+    // 所以多个处理器同时进来也不会把同一个槽位写两次。
+    for (int i = 0; i < kMaxSlots; ++i) {
+        int expected = 1;
+        if (__atomic_compare_exchange_n(&g_slots[i].state, &expected, 3, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            g_slots[i].ip = ip;
+            __atomic_store_n(&g_slots[i].state, 2, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+
+    // 没有任何槽位在等回填（理论上不该发生），丢掉即可
+    __atomic_add_fetch(&g_handler_miss, 1, __ATOMIC_RELAXED);
 }
 
 //----------------------------------------------------------------------------------------
@@ -455,6 +485,14 @@ bool ps_platform_init() {
     }
     if (g_sig < 0) return false;
 
+    if (g_ps_debug) {
+        sigset_t cur;
+        sigemptyset(&cur);
+        pthread_sigmask(SIG_SETMASK, 0, &cur);
+        fprintf(stderr, "[perfstat-hb] platform_init: sig=%d blocked_in_me=%d\n", g_sig,
+                sigismember(&cur, g_sig) ? 1 : 0);
+    }
+
     // 【这里绝对不要 pthread_sigmask(SIG_BLOCK, ...)】
     //
     // 踩过的坑：为了保证"采样线程自己不被这个信号打断"，最初在这里屏蔽了采样信号。
@@ -583,6 +621,18 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
     const pid_t pid = getpid();
     int count = 0;
 
+    {
+        static int dbg_targets = 0;
+        if (g_ps_debug && dbg_targets < 6) {
+            fprintf(stderr, "[perfstat-hb] targets(i0=%d,n=%d) self=%d ->", i0, n, (int)self);
+            for (int k = 0; k < n && k < 8; ++k) {
+                fprintf(stderr, " %d", tid_list[i0 + k]);
+            }
+            fprintf(stderr, "\n");
+            dbg_targets++;
+        }
+    }
+
     for (int k = 0; k < n && count < max_ips; ++k) {
         if (__atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE)) break;
         const int pos = i0 + k;
@@ -610,6 +660,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         struct timespec start, now;
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (;;) {
+            // 2 = 已回填；3 = 别的副本的处理器正在认领它，再等一会儿就到 2 了
             if (__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE) == 2) {
                 unsigned long ip = __atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE);
                 if (ip) {
@@ -635,10 +686,13 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         }
         {
             static int dbg_slots = 0;
-            if (g_ps_debug && dbg_slots < 8) {
-                fprintf(stderr, "[perfstat-hb]   slot state=%d ip=%p tid=%d\n",
-                        (int)__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE),
-                        (void *)__atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE), tid);
+            if (g_ps_debug && dbg_slots < 10) {
+                int st = (int)__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE);
+                fprintf(stderr,
+                        "[perfstat-hb]   slot state=%d ip=%p tid=%d | handler_runs=%ld miss=%ld\n",
+                        st, (void *)__atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE), tid,
+                        (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED),
+                        (long)__atomic_load_n(&g_handler_miss, __ATOMIC_RELAXED));
                 dbg_slots++;
             }
         }
@@ -670,8 +724,11 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     {
         static int dbg_calls = 0;
         if (g_ps_debug && (dbg_calls < 3 || dbg_calls % 200 == 0)) {
-            fprintf(stderr, "[perfstat-hb] window: total_tids=%d window=%d self=%d sig=%d\n", total,
-                    window, (int)syscall(SYS_gettid), g_sig);
+            fprintf(stderr,
+                    "[perfstat-hb] window: tids=%d self=%d sig=%d | handler_runs=%ld miss=%ld\n",
+                    total, (int)syscall(SYS_gettid), g_sig,
+                    (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED),
+                    (long)__atomic_load_n(&g_handler_miss, __ATOMIC_RELAXED));
         }
         dbg_calls++;
     }
