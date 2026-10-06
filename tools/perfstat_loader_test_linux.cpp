@@ -37,18 +37,40 @@ static int g_pass = 0;
 
 // 看门狗：CI 上如果哪一步卡住，至少能在日志里看到卡在哪，
 // 并且主动退出（退出码 3），不要一直挂到 GitHub 的 6 小时上限。
-static volatile const char *g_phase = "start";
+//
+// 注意：信号处理器只能读，读到的指针永远指向字符串字面量（静态存储期），
+// 所以不会悬空。用数组下标而不是 volatile 指针，避免 const volatile 类型问题。
+static const char *g_phases[] = {
+    "start",
+    "dlopen 插件",
+    "plugin->Load()",
+    "输出通道验证",
+    "平台采样 2 秒",
+    "perf_dump / perf_top",
+    "Unload + dlclose",
+    "完成",
+};
+static volatile sig_atomic_t g_phase_idx = 0;
+
+static const char kTimeoutPrefix[] = "\n[loader] 超时！卡在阶段: ";
 
 static void on_alarm(int) {
-    const char *p = g_phase;
-    (void)!write(2, "\n[loader] 超时！卡在阶段: ", 32);
+    int i = (int)g_phase_idx;
+    if (i < 0 || i >= (int)(sizeof(g_phases) / sizeof(g_phases[0]))) i = 0;
+    const char *p = g_phases[i];
+    (void)!write(2, kTimeoutPrefix, sizeof(kTimeoutPrefix) - 1);
     (void)!write(2, p, strlen(p));
     (void)!write(2, "\n", 1);
     _exit(3);
 }
 
 static void phase(const char *p) {
-    g_phase = p;
+    for (size_t i = 0; i < sizeof(g_phases) / sizeof(g_phases[0]); ++i) {
+        if (strcmp(g_phases[i], p) == 0) {
+            g_phase_idx = (sig_atomic_t)i;
+            break;
+        }
+    }
     fprintf(stderr, "[loader] >>> %s\n", p);
     fflush(stderr);
 }
@@ -150,7 +172,15 @@ public:
     const char *argv[CCommand::COMMAND_MAX_ARGC];
 
     CmdBuilder(const char *line) {
-        memset(&cmd, 0, sizeof(cmd));
+        // 不用 memset：CCommand 是非平凡类型（有构造函数），
+        // gcc 会给 -Wclass-memaccess 警告。这里直接按字段清零。
+        int *raw0 = reinterpret_cast<int *>(&cmd);
+        raw0[0] = 0;
+        raw0[1] = 0;
+        char *sb = reinterpret_cast<char *>(&cmd);
+        sb[8] = 0;
+        const char **pp0 = reinterpret_cast<const char **>(sb + 1032);
+        pp0[0] = 0;
         strncpy(buf, line, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = 0;
 

@@ -25,10 +25,12 @@
 static volatile const char *g_phase = "start";
 static int g_timeout_sec = 60;
 
+static const char kTimeoutPrefix[] = "\n[smoke] 超时！卡在阶段: ";
+
 static void on_alarm(int) {
-    // 只用异步信号安全的东西
+    // 只用异步信号安全的东西（write 是异步信号安全的，printf 不是）
     const char *p = g_phase;
-    (void)!write(2, "\n[smoke] 超时！卡在阶段: ", 34);
+    (void)!write(2, kTimeoutPrefix, sizeof(kTimeoutPrefix) - 1);
     (void)!write(2, p, strlen(p));
     (void)!write(2, "\n", 1);
     _exit(3);

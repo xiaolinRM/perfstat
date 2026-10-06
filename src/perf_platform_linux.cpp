@@ -104,6 +104,21 @@ const char *ps_basename(const char *p) {
     return s ? s + 1 : p;
 }
 
+// 有界字符串拷贝，并保证 0 结尾。
+// 不用 strncpy 是因为 gcc 的 -Wstringop-truncation 会对"源串可能更长"的情况报警，
+// 而这个场景里我们本来就是故意截断的。
+void ps_copy_cstr(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    if (!src) {
+        dst[0] = 0;
+        return;
+    }
+    size_t n = strlen(src);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
 std::vector<int> list_tids() {
     std::vector<int> out;
     DIR *d = opendir("/proc/self/task");
@@ -462,8 +477,8 @@ void ps_enum_modules(ModuleVisits *out) {
         memset(&mi, 0, sizeof(mi));
         mi.base = (uintptr_t)lo;
         mi.size = (size_t)(hi - lo);
-        strncpy(mi.path, maps[i].path.c_str(), sizeof(mi.path) - 1);
-        strncpy(mi.name, ps_basename(mi.path), sizeof(mi.name) - 1);
+        ps_copy_cstr(mi.path, sizeof(mi.path), maps[i].path.c_str());
+        ps_copy_cstr(mi.name, sizeof(mi.name), ps_basename(mi.path));
         mi.is_main = first;
         first = false;
         if (out->count < out->capacity) out->items[out->count++] = mi;
@@ -486,8 +501,8 @@ void ps_enum_modules(ModuleVisits *out) {
             memset(&mi, 0, sizeof(mi));
             mi.base = 0;
             mi.size = 0;
-            strncpy(mi.path, exe, sizeof(mi.path) - 1);
-            strncpy(mi.name, ps_basename(mi.path), sizeof(mi.name) - 1);
+            ps_copy_cstr(mi.path, sizeof(mi.path), exe);
+            ps_copy_cstr(mi.name, sizeof(mi.name), ps_basename(mi.path));
             mi.is_main = (seen.empty());
             out->items[out->count++] = mi;
         }

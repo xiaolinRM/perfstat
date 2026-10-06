@@ -332,8 +332,30 @@ bool ps_platform_init() {
         if (fn && fn(g_process, &wow) && wow) g_wow64 = true;
     }
 
-    HMODULE psapi = LoadLibraryA("psapi.dll");
-    if (psapi) g_QueryWorkingSetEx = (QueryWorkingSetExFn)GetProcAddress(psapi, "QueryWorkingSetEx");
+    // QueryWorkingSetEx 的位置随 Windows 版本变过：
+    //   老版本在 psapi.dll；新版本内核导出的名字叫 K32QueryWorkingSetEx（在 kernel32.dll 里）。
+    // 两个都试一遍，全都拿不到也没关系 —— ps_walk_memory 会退化成"不区分驻留"，
+    // 至少内存量级是对的（之前这里失败会导致内存列全是 0）。
+    {
+        HMODULE psapi = GetModuleHandleA("psapi.dll");
+        if (!psapi) psapi = LoadLibraryA("psapi.dll");
+        if (psapi) {
+            g_QueryWorkingSetEx = (QueryWorkingSetExFn)GetProcAddress(psapi, "QueryWorkingSetEx");
+            if (!g_QueryWorkingSetEx) {
+                g_QueryWorkingSetEx = (QueryWorkingSetExFn)GetProcAddress(psapi, "K32QueryWorkingSetEx");
+            }
+        }
+        if (!g_QueryWorkingSetEx) {
+            HMODULE k32 = GetModuleHandleA("kernel32.dll");
+            if (k32) {
+                g_QueryWorkingSetEx = (QueryWorkingSetExFn)GetProcAddress(k32, "K32QueryWorkingSetEx");
+                if (!g_QueryWorkingSetEx) {
+                    g_QueryWorkingSetEx =
+                        (QueryWorkingSetExFn)GetProcAddress(k32, "QueryWorkingSetEx");
+                }
+            }
+        }
+    }
 
     g_ws_info = (PSAPI_WORKING_SET_EX_INFORMATION *)malloc(sizeof(PSAPI_WORKING_SET_EX_INFORMATION) *
                                                            kChunkPages);
@@ -625,7 +647,10 @@ void ps_walk_memory(ModuleLookupFn lookup, void *user, ModuleInfo *mods, int mod
                     if (idx < 0 || idx >= mod_count) continue;
                     ModuleInfo &mi = mods[idx];
 
-                    bool resident = false;
+                    // 拿不到工作集信息时（QueryWorkingSetEx 不可用）不能把整页算成
+                    // "非驻留"，否则内存列会全是 0。这种情况按"已提交"归类到 mapped/
+                    // private，至少量级是对的。
+                    bool resident = true;
                     if (have_ws) resident = (g_ws_info[k].VirtualAttributes.Valid != 0);
                     if (!resident) {
                         mi.other_bytes += page_size;

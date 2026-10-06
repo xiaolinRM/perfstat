@@ -336,12 +336,15 @@ static void make_short(const std::string &in, char *out, size_t out_size) {
 }
 
 void Profiler::report(OutFn out, void *user, const Options &opt) {
-    Snapshot s;
-    take_snapshot(s);
+    // 注意顺序：必须先收集内存，再取快照。
+    // 之前是先 take_snapshot() 再 collect_memory_locked()，于是内存数据永远晚一拍
+    // 才写进快照，报告里那一列永远是 0。
     if (!opt.no_memory) {
         AutoLock lk(m_lock);
         collect_memory_locked();
     }
+    Snapshot s;
+    take_snapshot(s);
 
     m_out = out;
     m_out_user = user;

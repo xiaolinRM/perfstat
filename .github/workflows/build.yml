@@ -57,16 +57,22 @@ jobs:
           Write-Host "产物校验通过：32 位，导出 CreateInterface"
 
       # ---- 算法/ABI 自检 ----
+      # 注意：这里用【退出码】判断成败，不要用 findstr 去匹配中文（"失败 0 项"）。
+      # findstr 对 UTF-8 中文的匹配不可靠，即使测试全过也会判成失败。
+      # 自检程序本身在失败时返回 1、成功返回 0。
       - name: 编译并运行算法自检
         shell: cmd
         run: |
           call tools\build_tests.bat
           if errorlevel 1 exit /b 1
           build\perfstat_tests.exe > build\selftest.log 2>&1
-          if errorlevel 1 exit /b 1
+          if errorlevel 1 (
+            echo [ERROR] perfstat_tests.exe reported failures
+            type build\selftest.log
+            exit /b 1
+          )
           type build\selftest.log
-          findstr /C:"失败 0 项" build\selftest.log
-          if errorlevel 1 exit /b 1
+          echo [OK] perfstat_tests.exe passed
 
       # ---- 加载自检 ----
       - name: 编译并运行加载自检
@@ -75,10 +81,13 @@ jobs:
           call tools\build_loader_test.bat
           if errorlevel 1 exit /b 1
           build\perfstat_loader_test.exe > build\loader_test.log 2>&1
-          if errorlevel 1 exit /b 1
+          if errorlevel 1 (
+            echo [ERROR] perfstat_loader_test.exe reported failures
+            type build\loader_test.log
+            exit /b 1
+          )
           type build\loader_test.log
-          findstr /C:"失败 0 项" build\loader_test.log
-          if errorlevel 1 exit /b 1
+          echo [OK] perfstat_loader_test.exe passed
 
       # ---- 打包 ----
       - name: 打包 Windows 产物
@@ -142,6 +151,7 @@ jobs:
 
       # 先跑“平台层冒烟测试”：只验证信号采样 / 模块枚举 / 符号解析，不加载插件。
       # 万一加载自检卡住，这一步能立刻说明问题出在平台层还是插件加载流程。
+      # 同样用退出码判断（grep 中文不可靠）。
       - name: 运行平台层冒烟测试
         run: |
           set -e
@@ -153,7 +163,7 @@ jobs:
             echo "::error::平台层冒烟测试失败或超时（exit=$rc）"
             exit 1
           fi
-          grep -q "全部阶段完成" build/smoke_linux.log
+          echo "平台层冒烟测试通过"
 
       # 再跑完整加载自检：dlopen 插件 + 假 ICvar + 指令注册/派发 + 真实采样
       # 2>&1 是为了同时收 stdout/stderr（看门狗会把卡住的阶段写进 stderr）
@@ -169,7 +179,6 @@ jobs:
             echo "::error::Linux 加载自检失败或超时（exit=$rc）"
             exit 1
           fi
-          grep -q "失败 0 项" build/loader_test_linux.log
           echo "Linux 加载自检通过"
 
       # ---- 打包 ----
