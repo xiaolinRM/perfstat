@@ -19,7 +19,7 @@
 // 真实服务器里插件只有一份副本，不存在这个问题，所以这里不去碰它。
 //
 // 构建：make -f tools/Makefile.linux_tests   （或在 CI 里直接 g++ 编译）
-// 运行：./build/perfstat_loader_test_linux <perfstat_srv.so 路径>
+// 运行：./build/perfstat_loader_test_linux <perfstat.so 路径>
 //========================================================================================
 
 #include <dlfcn.h>
@@ -271,7 +271,7 @@ public:
 // 采样线程：让服务器"忙"起来，这样采样才有东西可采
 //
 // 注意：这次踩过一个坑 —— 原来忙循环直接内联在 busy_thread 里，
-// 编译器把它优化后可能落在别的模块（实测样本跑到了 perfstat_srv.so），
+// 编译器把它优化后可能落在别的模块（实测样本跑到了 perfstat.so），
 // 于是"样本应落在本程序模块内"的断言就失败了。
 // 现在把它做成一个显式导出的函数，确保这段代码一定在测试程序自己的 .text 里。
 //----------------------------------------------------------------------------------------
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
     printf("================================================================================\n");
     fprintf(stderr, "[loader] 看门狗已启用：%d 秒\n", timeout_sec);
 
-    const char *so_path = argc > 1 ? argv[1] : "Release/perfstat_srv.so";
+    const char *so_path = argc > 1 ? argv[1] : "Release/perfstat.so";
     printf("目标插件: %s\n\n", so_path);
     printf("sizeof(CCommand)=%d sizeof(ConCommandBase)=%d sizeof(ConCommand)=%d\n",
            (int)sizeof(CCommand), (int)sizeof(ConCommandBase), (int)sizeof(ConCommand));

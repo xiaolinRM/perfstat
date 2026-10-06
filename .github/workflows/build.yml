@@ -98,7 +98,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\perfstat-windows\addons | Out-Null
           New-Item -ItemType Directory -Force -Path dist\perfstat-windows\tests  | Out-Null
           Copy-Item build\perfstat.dll -Destination dist\perfstat-windows\addons\
-          Copy-Item perfstat.ini,README.md -Destination dist\perfstat-windows\
+          Copy-Item perfstat.vdf,perfstat.ini,README.md -Destination dist\perfstat-windows\
           Copy-Item build\perfstat_tests.exe,build\perfstat_loader_test.exe -Destination dist\perfstat-windows\tests\
           Copy-Item build\selftest.log,build\loader_test.log -Destination dist\perfstat-windows\tests\
           Compress-Archive -Path dist\perfstat-windows -DestinationPath dist\perfstat-windows.zip -Force
@@ -112,7 +112,7 @@ jobs:
           if-no-files-found: error
 
   # ======================================================================================
-  # Linux：编 32 位 perfstat_srv.so，跑 POSIX 加载自检，打包上传
+  # Linux：编 32 位 perfstat.so，跑 POSIX 加载自检，打包上传
   # ======================================================================================
   linux:
     name: Linux (i386 / g++)
@@ -132,17 +132,17 @@ jobs:
         run: g++ --version
 
       # ---- 编译插件 ----
-      - name: 编译 perfstat_srv.so
+      - name: 编译 perfstat.so
         run: make
 
       # ---- 校验产物：32 位 ELF + 导出符号 ----
       - name: 校验产物
         run: |
           set -e
-          test -f Release/perfstat_srv.so || { echo "没有生成 Release/perfstat_srv.so"; exit 1; }
-          file Release/perfstat_srv.so
-          file Release/perfstat_srv.so | grep -q "ELF 32-bit"
-          nm -D --defined-only Release/perfstat_srv.so | grep -E "CreateInterface|perfstat_factory"
+          test -f Release/perfstat.so || { echo "没有生成 Release/perfstat.so"; exit 1; }
+          file Release/perfstat.so
+          file Release/perfstat.so | grep -q "ELF 32-bit"
+          nm -D --defined-only Release/perfstat.so | grep -E "CreateInterface|perfstat_factory"
           echo "产物校验通过：32 位 ELF，导出 CreateInterface / perfstat_factory"
 
       # ---- 自检 ----
@@ -171,7 +171,7 @@ jobs:
         run: |
           set -e
           rc=0
-          timeout 180 ./build/perfstat_loader_test_linux Release/perfstat_srv.so 120 \
+          timeout 180 ./build/perfstat_loader_test_linux Release/perfstat.so 120 \
               > build/loader_test_linux.log 2>&1 || rc=$?
           echo "===== loader test log ====="
           cat build/loader_test_linux.log
@@ -187,8 +187,8 @@ jobs:
           set -e
           rm -rf dist
           mkdir -p dist/perfstat-linux/addons dist/perfstat-linux/tests
-          cp Release/perfstat_srv.so dist/perfstat-linux/addons/
-          cp perfstat.ini README.md  dist/perfstat-linux/
+          cp Release/perfstat.so dist/perfstat-linux/addons/
+          cp perfstat.vdf perfstat.ini README.md dist/perfstat-linux/
           cp build/perfstat_loader_test_linux build/perfstat_smoke_linux dist/perfstat-linux/tests/
           cp build/loader_test_linux.log build/smoke_linux.log       dist/perfstat-linux/tests/
           cd dist && zip -r perfstat-linux.zip perfstat-linux

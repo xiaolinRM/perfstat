@@ -84,7 +84,7 @@ cl /nologo /LD /MT /O2 /Ob2 /Oi /GS- /W3 /EHsc /utf-8 /GR- /DNDEBUG /DWIN32 /D_W
 ```bash
 # 64 位机器上编 32 位需要 multilib
 sudo apt install g++-multilib
-make            # 产物：Release/perfstat_srv.so
+make            # 产物：Release/perfstat.so
 ```
 
 > ℹ️ **Linux 由 GitHub Actions 验证，不是我在本机编的。**
@@ -134,16 +134,38 @@ include 路径。此时：
 
 ## 3. 安装与加载
 
-把编译产物放到服务器的 `left4dead2/addons/` 目录：
+### 3.1 推荐：用 `.vdf` 自动加载
+
+把这三个文件放进服务器的 `left4dead2/addons/` 目录：
 
 ```
 left4dead2/
 └── addons/
-    └── perfstat.dll        (Windows)
-    └── perfstat_srv.so     (Linux)
+    ├── perfstat.vdf          # 自动加载配置（下面有内容说明）
+    ├── perfstat.ini          # 可选配置
+    ├── perfstat.dll          # Windows 产物
+    └── perfstat.so           # Linux 产物（两个平台只需要放对应的那一个）
 ```
 
-然后在服务器控制台：
+`perfstat.vdf` 的内容（和 l4dtoolz 一样的写法）：
+
+```
+"Plugin"
+{
+	"file"	"addons/perfstat"
+}
+```
+
+注意 `"file"` 里写的是**不带扩展名的基名** —— 引擎自己按平台拼成 `.dll` / `.so`。
+所以 **Linux 产物必须正好叫 `perfstat.so`**，写成别的名字（例如服务端自带的 `_srv` 那种）
+自动加载会找不到。
+
+放好之后**下次开服就会自动加载**，不需要手动输入任何指令。
+控制台可以用 `plugin_print` 确认列表里有 perfstat。
+
+> 分隔符必须是**制表符**（tab），键和值都要加引号，`addons/` 用正斜杠。
+
+### 3.2 手动加载（临时用 / 调试用）
 
 ```
 plugin_print                :: 顺便确认插件列表里有 perfstat
@@ -153,6 +175,10 @@ perf_help
 
 加载成功后控制台会打印一段说明。如果 `plugin_load` 报 `Unable to load plugin`，
 先确认位数是 32 位（见上一节）。
+
+> **卸载注意**：`plugin_unload` 之后插件会**刻意保留控制台命令对象的内存**（不 free）。
+> 这是有意为之，不是泄漏 bug —— 因为引擎侧的 ConCommandBase 链表可能仍持有这些对象，
+> 一旦 free 掉，下次在输入框里**打任意一个字**（触发补全）就会崩溃。详见第 9 节 FAQ。
 
 ---
 
@@ -387,9 +413,40 @@ CPU% = 该模块命中采样数 / 总采样数
 
 ## 9. 常见问题
 
+**Q：`plugin_unload` 之后不崩，但在输入框里打任意一个字（不用回车）就崩溃？**
+
+这是 v1.4.2 修掉的真 bug，崩溃转储的特征很明确：
+
+```
+exception code : 0xC0000005 (ACCESS_VIOLATION)
+AV type        : read at 0x00000000     ← 读的是空地址，不是某个已释放的堆地址
+EIP            : ntdll.dll+0x739BC
+```
+
+**根因**：引擎的 `ConCommandBase` 是靠对象自带的 `s_pNext` 串成链表的，而客户端输入框
+**每次按键**都会遍历这条链做补全/高亮。我们原来在 `UnregisterConCommand` 之后
+
+```cpp
+delete p;      // ← 问题在这里
+```
+
+把命令对象还给了堆。引擎下次按键时按旧指针去访问，对象里的 **vtable 已经被清零**，
+于是"调用虚函数"变成"读地址 0 处的函数指针" → `read at 0x00000000` → 崩溃。
+
+这解释了为什么是"打字才崩"：不按键就不会去遍历补全。
+
+**修法**：卸载时**只反注册、不释放**命令对象的内存（名字字符串也保留）。
+这点内存（10 条命令、几百字节）就是插件唯一的"泄漏"，而插件卸载后进程通常马上就要
+结束（换图/关服），代价可忽略。**宁可留着，也不能把悬空指针交给引擎** ——
+这是所有引擎插件的通行做法。
+
+> 原来的代码还有第二个隐患：边遍历边 `delete`，而 `next = p->GetNext()` 是从
+> **已经/即将释放**的对象里读出来的。现在整段删掉，一并消除。
+
 **Q：`plugin_load perfstat` 提示 `Unable to load plugin`？**
 确认是 32 位 DLL（`dumpbin /headers perfstat.dll` 看 `machine (x86)`），
-并且文件确实在 `addons/` 目录下。
+并且文件确实在 `addons/` 目录下。Linux 上还要确认产物名是 **`perfstat.so`**
+（`.vdf` 里写的是不带扩展名的基名 `addons/perfstat`，引擎自己拼 `.so`）。
 
 **Q：加载成功但 `perf_stat` 报 `Unknown command`？**
 说明指令没注册上（拿不到 `VEngineCvar007`）。看加载时的输出有没有
@@ -453,7 +510,7 @@ CPU% = 该模块命中采样数 / 总采样数
 
 6. **进程里存在多份"平台层副本"，信号处理器被覆盖（v1.0.9 / v1.1.0 修）**
    这个坑最隐蔽。离线自检的 Makefile **只编平台层、不编 `core.cpp`**，所以
-   `perfstat_loader_test_linux` 和 `perfstat_srv.so` 里**各有一份** `perf_platform_linux.cpp`。
+   `perfstat_loader_test_linux` 和 `perfstat.so` 里**各有一份** `perf_platform_linux.cpp`。
    两份各有自己的 `g_sig` / `g_slots` / **信号处理器**，而：
    - 信号处理器是**进程级**的，后装的会覆盖先装的；
    - `g_slots` 却是每份副本各自的。
@@ -526,7 +583,7 @@ CPU% = 该模块命中采样数 / 总采样数
 
 10. **自检里两条断言本身写错了（v1.0.7 修）**
    - "样本应落在本程序模块内"：忙循环原来内联在测试的线程函数里，被编译器优化后
-     可能落到别的模块（实测跑到了 `perfstat_srv.so`），断言自然失败。
+     可能落到别的模块（实测跑到了 `perfstat.so`），断言自然失败。
      现在把忙循环做成显式导出的函数，确保那段代码一定在测试程序自己的 `.text` 里。
    - 用 `ps::g_profiler` 检查"插件自己采到多少样本"：在测试程序里那会解析成
      **另一个同名变量**（初值 null），等于没测。现在插件明确导出
@@ -652,7 +709,7 @@ make -f tools/Makefile.linux_tests smoke
 
 ```bash
 make -f tools/Makefile.linux_tests
-./build/perfstat_loader_test_linux Release/perfstat_srv.so
+./build/perfstat_loader_test_linux Release/perfstat.so
 ```
 
 因为 Linux 上没有引擎可以托管插件，这个自检用 `dlopen` 直接把 `.so` 当普通共享库加载：
@@ -704,7 +761,7 @@ profiler 样本数有没有增长**。真实服务器里插件只有一份副本
 
 3. **忙线程的代码要落在自己的模块里**
    忙循环如果内联在别处，编译器可能把那段代码放到别的模块，
-   于是"样本应落在本程序模块内"的断言会失败（实测跑到了 `perfstat_srv.so`）。
+   于是"样本应落在本程序模块内"的断言会失败（实测跑到了 `perfstat.so`）。
    修法：忙循环做成**显式导出 + noinline** 的函数。
 
 这两条加上前面那条"loader test 不要自己采样"，本质是同一件事：
@@ -739,12 +796,12 @@ profiler 样本数有没有增长**。真实服务器里插件只有一份副本
 sudo apt-get install -y g++ g++-multilib make
 
 # 2. 编译
-make                                  # 插件 -> Release/perfstat_srv.so
+make                                  # 插件 -> Release/perfstat.so
 make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 # 3. 跑（两个都必须 exit 0）
 ./build/perfstat_smoke_linux 60
-./build/perfstat_loader_test_linux Release/perfstat_srv.so 120
+./build/perfstat_loader_test_linux Release/perfstat.so 120
 ```
 
 验收标准（自检结尾会打印一段"诊断摘要"，看那段就够，不用翻整份日志）：
@@ -785,8 +842,8 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-| `perfstat-windows.zip` | `addons/perfstat.dll`、`perfstat.ini`、`README.md`、两个自检 exe 与日志 |
-| `perfstat-linux.zip` | `addons/perfstat_srv.so`、`perfstat.ini`、`README.md`、Linux 自检程序与日志 |
+| `perfstat-windows.zip` | `addons/perfstat.dll`、`perfstat.vdf`、`perfstat.ini`、`README.md`、两个自检 exe 与日志 |
+| `perfstat-linux.zip` | `addons/perfstat.so`、`perfstat.vdf`、`perfstat.ini`、`README.md`、Linux 自检程序与日志 |
 | `perfstat-all-platforms.zip` | 上面两个合并成一个总包（一次下载搞定） |
 
 工作流做了这些事：

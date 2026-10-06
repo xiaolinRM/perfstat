@@ -632,6 +632,25 @@ ConCommand *perf_register_command(const char *name, const char *help) {
     return cmd;
 }
 
+//----------------------------------------------------------------------------------------
+// 反注册控制台指令
+//
+// 【重要】这里【故意不 delete】命令对象，也刻意留下名字字符串。这是有意为之，不是漏写。
+//
+// 为什么：Source 引擎的 ConCommandBase 是靠对象自带的 s_pNext 串成链表的，而且
+// 客户端输入框在每次按键时都会遍历这条链做补全/高亮。也就是说即使我们调用了
+// UnregisterConCommand，引擎侧仍可能持有（或即将再次访问）这些对象的指针/名字。
+//
+// 实测症状（本地客户端）：plugin_unload 之后不崩，但在输入框里【随便打一个字】立刻崩溃
+// —— 因为按键触发补全，补全去读已经被 free 掉的 ConCommand，是 use-after-free。
+//
+// 另外原来的写法还有第二个 bug：边遍历边 delete，而 next = p->GetNext() 是从
+// 【即将/已经释放】的对象里读出来的，本身就不安全。
+//
+// 所以现在：只反注册、不释放。这点内存（10 条命令，几百字节）就是插件唯一的"泄漏"，
+// 而插件卸载后进程通常马上就要结束（换图/关服），代价可以忽略。
+// 宁可留着，也不能把悬空指针交给引擎 —— 这是所有引擎插件的通行做法。
+//----------------------------------------------------------------------------------------
 void perf_unregister_commands() {
     vlog("unregister: begin (%d commands)", g_cmd_count);
     if (g_pCvar) {
@@ -641,16 +660,12 @@ void perf_unregister_commands() {
         }
     }
     vlog("unregister: UnregisterConCommand done");
-    ConCommandBase *p = g_cmd_head;
-    while (p) {
-        ConCommandBase *next = p->GetNext();
-        vlog("unregister: delete '%s'", p->GetName() ? p->GetName() : "?");
-        delete p;
-        p = next;
-    }
+
+    // 只把链表从我们这边摘掉，让重载时可以重新注册；对象内存【不释放】。
+    // （ConCommandBase::s_pNext 在引擎侧可能仍指向这些对象，见上面的说明）
     g_cmd_head = 0;
     g_cmd_count = 0;
-    vlog("unregister: end");
+    vlog("unregister: end (命令对象内存刻意保留，避免引擎侧 use-after-free)");
 }
 
 void ps_register_console_commands() {

@@ -27,10 +27,14 @@ LIBS      = -lpthread -ldl -lm
 
 SRCDIR    = src
 BIN_DIR   = Release
-TARGET    = $(BIN_DIR)/$(PROJECT)_srv.so
+TARGET    = $(BIN_DIR)/$(PROJECT).so
 
-# 目标名写成 perfstat_srv.so 只是沿用 Source 服务器的命名习惯，
-# plugin_load 时用哪个名字就用哪个文件，改成 perfstat.so 也可以。
+# 【为什么产物必须叫 perfstat.so】
+# Source 的自动加载是靠 .vdf 文件，里面 "file" 写的是【不带扩展名的基名】：
+#     "Plugin" { "file" "addons/perfstat" }
+# 引擎自己按平台拼成 .dll（Windows）/ .so（Linux）。所以 Linux 产物必须正好叫
+# perfstat.so，写别的名字（例如服务端自带的 _srv 那种）自动加载会找不到 —— 
+# 那个 _srv 命名是引擎自己的内部文件习惯，不是插件约定。
 
 all: $(TARGET)
 
@@ -44,14 +48,11 @@ $(TARGET): $(addprefix $(BIN_DIR)/,$(OBJECTS:.cpp=.o))
 	$(CXX) $(LDFLAGS) $^ $(LIBS) -s -o $@
 	@echo ""
 	@echo "构建完成: $(TARGET)"
-	@echo "安装: 把该文件放到服务器的 left4dead2/addons/ 目录下，然后执行 plugin_load perfstat"
+	@echo "安装: 把 perfstat.so + perfstat.vdf + perfstat.ini 放进 left4dead2/addons/"
+	@echo "      自动加载（下次开服生效）；或手动执行 plugin_load perfstat"
 	@echo ""
-
-# 方便：make so 也能得到 Release/perfstat.so
-so: $(TARGET)
-	cp $(TARGET) $(BIN_DIR)/$(PROJECT).so
 
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: all so clean
+.PHONY: all clean

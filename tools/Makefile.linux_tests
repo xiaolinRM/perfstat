@@ -3,7 +3,7 @@
 #
 #   make -f tools/Makefile.linux_tests                  # 两个都编
 #   make -f tools/Makefile.linux_tests smoke            # 只编冒烟测试
-#   ./build/perfstat_loader_test_linux Release/perfstat_srv.so
+#   ./build/perfstat_loader_test_linux Release/perfstat.so
 #   ./build/perfstat_smoke_linux 60
 #
 # 自检程序需要用到平台层（模块枚举 / 采样）来交叉验证，所以直接编译
