@@ -809,6 +809,12 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 
 void ps_set_debug(int on) { __atomic_store_n(&g_ps_debug, on ? 1 : 0, __ATOMIC_RELEASE); }
 
+// 诊断用：本副本的信号处理器一共运行了多少次。
+// 自检拿它来判断"进程里实际生效的处理器是哪一份副本的"。
+long ps_handler_run_count(void) {
+    return (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED);
+}
+
 void ps_prepare_sampling_thread(void) {
     if (!g_inited) ps_platform_init();
     if (g_sig < 0) return;

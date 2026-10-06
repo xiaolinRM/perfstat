@@ -743,6 +743,9 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 //----------------------------------------------------------------------------------------
 void ps_set_debug(int on) { InterlockedExchange((volatile LONG *)&g_ps_debug, on ? 1 : 0); }
 
+// Windows 不用信号采样，恒为 0（保持接口一致）
+long ps_handler_run_count(void) { return 0; }
+
 // Windows 用 SuspendThread + GetThreadContext 取指令指针，不依赖信号，
 // 所以不需要"解开信号屏蔽"这一步。
 void ps_prepare_sampling_thread(void) {}

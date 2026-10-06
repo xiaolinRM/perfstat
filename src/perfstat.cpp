@@ -88,6 +88,12 @@ extern "C" PS_DLL_EXPORT void perfstat_set_verbose(int on) {
 // 所以明确导出一个函数。
 extern "C" PS_DLL_EXPORT void *perfstat_get_profiler(void) { return (void *)ps::g_profiler; }
 
+// 自检用它来看"这台进程里，插件副本的信号处理器到底跑了多少次"。
+// 如果一直是 0，说明生效的是别的副本的处理器（多副本场景下的关键证据）。
+extern "C" PS_DLL_EXPORT long perfstat_handler_runs(void) {
+    return ps::ps_handler_run_count();
+}
+
 //----------------------------------------------------------------------------------------
 // 控制台输出
 //

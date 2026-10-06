@@ -12,10 +12,12 @@
 // 运行：./build/perfstat_smoke_linux [超时秒数]
 //========================================================================================
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <vector>
@@ -23,6 +25,47 @@
 #include "../src/platform.h"
 
 static int g_timeout_sec = 60;
+static int g_fails = 0;
+
+#define CHECK_TRUE(cond, msg)                                    \
+    do {                                                         \
+        if (cond) {                                              \
+            fprintf(stderr, "[smoke] OK: %s\n", msg);           \
+        } else {                                                 \
+            fprintf(stderr, "[smoke] FAIL: %s\n", msg);         \
+            g_fails++;                                           \
+        }                                                        \
+    } while (0)
+
+// 忙线程：代码显式导出 + noinline，保证就在本程序自己的 .text 里，
+// 这样"样本归属到本模块"这个断言才有意义。
+static volatile int g_busy = 0;
+static volatile unsigned long long g_sink = 0;
+
+extern "C" __attribute__((noinline, used, visibility("default"))) void perfstat_smoke_busy(
+    unsigned spin) {
+    unsigned long long acc = 0;
+    for (unsigned i = 0; i < spin; ++i) {
+        acc += (unsigned long long)i * 2654435761u;
+        acc ^= acc >> 13;
+    }
+    g_sink += acc;
+}
+
+static void *busy_thread_fn(void *) {
+    while (g_busy) perfstat_smoke_busy(200000);
+    return 0;
+}
+
+static void start_busy_thread(pthread_t *t) {
+    g_busy = 1;
+    pthread_create(t, 0, busy_thread_fn, 0);
+}
+
+static void stop_busy_thread(pthread_t t) {
+    g_busy = 0;
+    pthread_join(t, 0);
+}
 
 // 看门狗用的阶段表。
 //
@@ -41,6 +84,7 @@ static const char *g_phases[] = {
     "ps_sample_threads 单次",
     "连续采样 100 轮",
     "ps_symbols_open / ps_symbolize",
+    "延迟与归因验证",
     "完成",
 };
 static volatile sig_atomic_t g_phase_idx = 0;
@@ -194,8 +238,61 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ---- 7. 单次延迟 + 归因（这一段是平台层的确定性验证）----
+    phase("延迟与归因验证");
+    {
+        // 起一个忙线程，它的代码在【本程序自己的 .text】里（显式导出、noinline），
+        // 所以采到的样本必须能归属回本程序这个模块。
+        pthread_t bt;
+        start_busy_thread(&bt);
+        // 本程序的模块范围
+        static ps::ModuleInfo mods[512];
+        ps::ModuleVisits mv;
+        mv.items = mods;
+        mv.count = 0;
+        mv.capacity = 512;
+        ps::ps_enum_modules(&mv);
+        uintptr_t self_base = 0;
+        size_t self_size = 0;
+        for (int i = 0; i < mv.count; ++i) {
+            if (strstr(mods[i].name, "perfstat_smoke") != NULL) {
+                self_base = mods[i].base;
+                self_size = mods[i].size;
+                break;
+            }
+        }
+        CHECK_TRUE(self_base != 0, "定位到本程序的模块范围");
+
+        uintptr_t ips[64];
+        uint32_t tids[64];
+        int total = 0, in_self = 0, slow = 0;
+        double worst = 0.0;
+        for (int round = 0; round < 100; ++round) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int n = ps::ps_sample_threads(ips, tids, 64);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+            if (ms > worst) worst = ms;
+            if (ms > 15.0) slow++;
+            for (int i = 0; i < n; ++i) {
+                total++;
+                if (self_base && ips[i] >= self_base && ips[i] < self_base + self_size) in_self++;
+            }
+            usleep(5000);
+        }
+        stop_busy_thread(bt);
+
+        fprintf(stderr,
+                "[smoke] 采样 100 轮：样本 %d，落在本模块 %d；单次最慢 %.2f ms，>15ms 的 %d 轮\n",
+                total, in_self, worst, slow);
+        CHECK_TRUE(total > 50, "连续采样能采到足够样本");
+        CHECK_TRUE(in_self > 0, "样本能正确归属到本程序模块（信号采样+归因都正常）");
+        CHECK_TRUE(slow == 0, "没有一轮采样卡在 15ms 以上（信号处理器正常回填槽位）");
+    }
+
     alarm(0);
     fprintf(stderr, "[smoke] 全部阶段完成，失败 %d 项\n", fails);
     fflush(stderr);
-    return fails == 0 ? 0 : 1;
+    return (fails == 0 && g_fails == 0) ? 0 : 1;
 }

@@ -72,6 +72,9 @@ bool ps_stop_requested(void);
 // 自检就会链接失败（踩过一次）。
 void ps_set_debug(int on);
 
+// 诊断用：本副本的信号处理器累计运行次数（Linux 有意义，Windows 恒为 0）
+long ps_handler_run_count(void);
+
 // 采样线程启动后第一件事就该调用它。
 //
 // 作用：把采样信号从"本线程"的信号掩码里解开。
