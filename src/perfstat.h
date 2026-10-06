@@ -52,7 +52,7 @@ static_assert(sizeof(CCommand) == 1288,
 static_assert(sizeof(void *) == 4,
               "必须编译成 32 位（/MACHINE:X86 或 -m32），L4D2 服务器是 32 位进程");
 
-#define PERFSTAT_VERSION "1.1.3"
+#define PERFSTAT_VERSION "1.1.4"
 
 namespace ps {
 

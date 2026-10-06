@@ -355,6 +355,19 @@ int main(int argc, char **argv) {
     // 至于"信号采样通路本身对不对"，由 tools/perfstat_smoke_linux.cpp 负责
     // （那个程序里只有一份平台副本，是确定性的验证）。
     {
+        // 【先关掉自动停止】perfstat.ini 里 duration_sec 默认是 2 秒，
+        // 插件 Load() 时就会按它启动"2 秒后自动停"。而 CI 里从加载到这一段
+        // 往往已经超过 2 秒 —— 插件早就停了，于是后面 sleep(2) 期间一个样本都不涨，
+        // 断言就会失败（踩过）。这里用 perf_start 10 0 明确改成"不自动停"。
+        {
+            ConCommand *cc = (ConCommand *)g_fake_cvar.FindCommandBase("perf_start");
+            CHECK(cc != 0, "找得到 perf_start 指令");
+            if (cc) {
+                CmdBuilder c("perf_start 10 0");
+                cc->Dispatch(c.cmd);
+            }
+        }
+
         // 插件自身的采样次数基线
         typedef void *(*GetProfilerFn)(void);
         typedef long (*HandlerRunsFn)(void);
@@ -394,6 +407,13 @@ int main(int argc, char **argv) {
 
         printf("  插件自身采样次数: %llu -> %llu（模块 %d / 线程 %d）\n", before, after, mods,
                threads);
+        if (getp) {
+            ps::Profiler *prof = (ps::Profiler *)getp();
+            if (prof) {
+                printf("  插件 profiler 状态: running=%d auto_stop=%d elapsed=%.1fs\n",
+                       (int)prof->running(), prof->auto_stop_sec(), prof->elapsed_seconds());
+            }
+        }
         printf("  插件副本的信号处理器运行次数: %ld -> %ld\n", hb, ha);
         CHECK(after > before, "插件自己的采样线程确实在采到样本（真实进程里可用）");
         CHECK(after > 0, "插件 profiler 样本数大于 0");
