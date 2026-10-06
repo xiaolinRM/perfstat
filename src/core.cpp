@@ -182,6 +182,19 @@ int Profiler::find_module_by_addr(uintptr_t addr) const {
 }
 
 void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
+    // 诊断：只在 verbose 下打点，而且每 100000 次才打一行（性能影响可忽略）。
+    // 用来确认"采样回来的 IP 到底有没有进到统计里"。
+    if (verbose_on()) {
+        static unsigned long long dbg_apply_calls = 0;
+        static unsigned long long dbg_apply_ip0 = 0;
+        dbg_apply_calls++;
+        if (!ip) dbg_apply_ip0++;
+        if (dbg_apply_calls == 1 || dbg_apply_calls % 100000 == 0) {
+            fprintf(stderr, "[perfstat-hb] apply_sample: calls=%llu ip_zero=%llu\n", dbg_apply_calls,
+                    dbg_apply_ip0);
+        }
+    }
+
     AutoLock lk(m_lock);
     if (!ip) {
         m_sample_errors++;
@@ -274,48 +287,72 @@ void Profiler::sampler_loop() {
 //----------------------------------------------------------------------------------------
 // 内存归因
 //----------------------------------------------------------------------------------------
+namespace {
+
+// 内存遍历用的上下文：模块基址快照 + 数量。
+// 回调在放锁状态下运行，所以这里用完全独立的一份数据，不碰 Profiler 的任何成员。
+struct MemWalkCtx {
+    ModuleInfo *mods;  // 输入：模块快照（按基址升序）
+    int count;         // 输入：模块数量
+};
+
+int mem_lookup(uintptr_t addr, void *user) {
+    MemWalkCtx *ctx = (MemWalkCtx *)user;
+    int best = -1;
+    for (int i = 0; i < ctx->count; ++i) {
+        if (ctx->mods[i].base <= addr) {
+            best = i;
+        } else {
+            break;  // 已按基址升序
+        }
+    }
+    if (best < 0) return -1;
+    if (addr < ctx->mods[best].base + ctx->mods[best].size) return best;
+    return -1;
+}
+
+}  // namespace
+
 void Profiler::collect_memory_locked() {
-    static ModuleInfo buf[1024];
+    // 调用本函数时【已经持有】m_lock（名字里的 locked 就是这个意思）。
+    //
+    // 【关键：慢操作必须放锁】ps_walk_memory 在 Linux 上要读 /proc/self/smaps
+    // 并遍历全部映射段，大进程上可能耗时数百毫秒到数秒。如果持着 m_lock 做这件事，
+    // 采样线程就会在 apply_sample() 里一直等锁 —— 表现是"采样线程在跑、但样本数不涨"，
+    // 而且不报任何错（踩过：自检里 total_samples 一直是 0、apply_sample 从未被调用）。
+    //
+    // 所以流程是：持锁取一份模块表快照 -> 放锁 -> 遍历内存 -> 再持锁合并结果。
+    static ModuleInfo snapshot[1024];
+    static ModuleInfo result[1024];
+
     if (m_modules.empty()) return;
     if ((int)m_modules.size() > 1024) return;
+    const int count = (int)m_modules.size();
 
-    // 先清空旧的统计
-    for (size_t i = 0; i < m_modules.size(); ++i) {
-        buf[i] = ModuleInfo();
-        buf[i].base = m_modules[i].base;
-        buf[i].size = m_modules[i].size;
-        strncpy(buf[i].path, m_modules[i].path.c_str(), sizeof(buf[i].path) - 1);
-        strncpy(buf[i].name, m_modules[i].name.c_str(), sizeof(buf[i].name) - 1);
-        buf[i].is_main = m_modules[i].is_main;
+    for (int i = 0; i < count; ++i) {
+        // 快照：回调里绝对不能再碰 Profiler（更不能碰锁），所以用独立的一份数据
+        snapshot[i] = ModuleInfo();
+        snapshot[i].base = m_modules[i].base;
+        snapshot[i].size = m_modules[i].size;
+        snapshot[i].is_main = m_modules[i].is_main;
+
+        result[i] = ModuleInfo();
+        result[i].base = m_modules[i].base;
+        result[i].size = m_modules[i].size;
     }
 
-    // 注意：lookup 回调里不能再次加锁（本函数已经持锁），所以直接内联一个二分查找
-    struct Local {
-        static int lookup(uintptr_t addr, void *user) {
-            Profiler *p = (Profiler *)user;
-            // 这里不能调用 find_module_by_addr 的加锁版本，直接内联二分
-            int lo = 0, hi = (int)p->m_modules.size() - 1, best = -1;
-            while (lo <= hi) {
-                int mid = (lo + hi) / 2;
-                if (p->m_modules[mid].base <= addr) {
-                    best = mid;
-                    lo = mid + 1;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            if (best < 0) return -1;
-            if (addr < p->m_modules[best].base + p->m_modules[best].size) return best;
-            return -1;
-        }
-    };
+    MemWalkCtx ctx;
+    ctx.mods = snapshot;
+    ctx.count = count;
 
-    ps_walk_memory(&Local::lookup, this, buf, (int)m_modules.size());
+    m_lock.unlock();  // ---- 放锁，做慢操作 ----
+    ps_walk_memory(&mem_lookup, &ctx, result, count);
+    m_lock.lock();  // ---- 重新加锁，合并结果 ----
 
-    for (size_t i = 0; i < m_modules.size(); ++i) {
-        m_modules[i].mem_mapped = buf[i].mapped_bytes;
-        m_modules[i].mem_private = buf[i].private_bytes;
-        m_modules[i].mem_other = buf[i].other_bytes;
+    for (int i = 0; i < count && i < (int)m_modules.size(); ++i) {
+        m_modules[i].mem_mapped = result[i].mapped_bytes;
+        m_modules[i].mem_private = result[i].private_bytes;
+        m_modules[i].mem_other = result[i].other_bytes;
     }
 }
 
