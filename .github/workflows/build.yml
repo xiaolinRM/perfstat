@@ -92,14 +92,24 @@ jobs:
       # ---- 打包 ----
       # 目录结构照 Source 插件的通行做法：vdf 和 dll 都放在 addons/ 里面。
       #
-      # 注意【不要让 zip 里再套一层同名 zip】：
-      #   原来用 Compress-Archive -Path dist\perfstat-windows 会把整个目录（"目录"本身是顶层条目）
-      #   压进去，上传时再被 runner 包一层，解压出来就会是 "文件夹/又一层"。
-      #   所以这里先 cd 进目录再压里面的内容（-Path .\* ），这样解压出来直接就是文件。
+      # 【重要】两个平台的 zip 内部层级必须一致：
+      #   perfstat-windows/addons/perfstat.dll
+      #   perfstat-linux/addons/perfstat.so
+      # 都是"一层与 zip 同名的目录"。汇总打包就是靠这个一致性才敢统一解包到 bundle/。
+      # 原来 Windows 压成了没有顶层目录的结构（addons/... 直接在根），
+      # 于是汇总步骤报"缺 windows 插件"（踩过）。
+      #
+      # 另外上传 artifact 时【只传 zip 文件本身】，不要把 dist/ 整个目录传上去 ——
+      # dist/ 里同时有解包目录，一起传的话 artifact（本身也是 zip）里会同时含
+      # 目录和 zip，用户下载解压就是"解压后还是同名 zip"（踩过）。
       - name: 打包 Windows 产物
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # 关掉进度条：Compress-Archive 内部的 Write-Progress 在非交互控制台上
+          # 会抛 "Win32 internal error Access is denied while reading the console
+          # output buffer"，导致整个打包步骤失败（本地实测踩过）。
+          $ProgressPreference = 'SilentlyContinue'
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist\perfstat-windows\addons | Out-Null
 
@@ -115,14 +125,23 @@ jobs:
           Copy-Item build\selftest.log,build\loader_test.log -Destination dist\perfstat-windows\tests\
 
           Push-Location dist
-          # 只压目录里的内容，确保 zip 解开后直接看到 addons/ 和 README.md
-          Compress-Archive -Path .\perfstat-windows\* -DestinationPath perfstat-windows.zip -Force
+          # 【结构与 Linux 保持一致】zip 里要带一层 perfstat-windows/ 目录。
+          #
+          # 为什么：Linux 那边是 `zip -r perfstat-linux.zip perfstat-linux`，条目形如
+          #   perfstat-linux/addons/perfstat.so
+          # 如果 Windows 这边压成 `addons/perfstat.dll`（没有顶层目录），两个 zip 的
+          # 内部层级就不一样了 —— 汇总打包时解包目标目录没法统一，很容易错
+          # （踩过：bundle 步骤报"缺 windows 插件"）。
+          # 所以这里压整个目录，让条目变成 perfstat-windows/addons/perfstat.dll。
+          Compress-Archive -Path .\perfstat-windows -DestinationPath perfstat-windows.zip -Force
           Pop-Location
 
-          # 校验：zip 里不应该再出现任何 .zip 条目
+          # 校验：条目层级必须和 Linux 一致，且不能嵌套 zip
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path dist\perfstat-windows.zip))
-          $entries = $z.Entries | ForEach-Object { $_.FullName }
+          # 统一成正斜杠再校验：Compress-Archive 在不同环境下可能写出反斜杠，
+          # 而 Linux 的 unzip / 汇总打包都按正斜杠处理，这里不规范化就会误报（实测踩过）。
+          $entries = @($z.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
           $z.Dispose()
           Write-Host "zip 条目:"
           $entries | ForEach-Object { Write-Host "  $_" }
@@ -130,12 +149,18 @@ jobs:
             Write-Error "zip 里还嵌套了 zip！"
             exit 1
           }
-          if (-not ($entries -match 'addons/perfstat\.dll')) {
-            Write-Error "zip 里没有 addons/perfstat.dll"
+          if (-not ($entries -match '^perfstat-windows/addons/perfstat\.dll$')) {
+            Write-Error "zip 里没有 perfstat-windows/addons/perfstat.dll（顶层目录层级不对）"
             exit 1
           }
-          if (-not ($entries -match 'addons/perfstat\.vdf')) {
-            Write-Error "zip 里没有 addons/perfstat.vdf"
+          if (-not ($entries -match '^perfstat-windows/addons/perfstat\.vdf$')) {
+            Write-Error "zip 里没有 perfstat-windows/addons/perfstat.vdf"
+            exit 1
+          }
+          $tops = @($entries | ForEach-Object { ($_ -split '/')[0] } | Sort-Object -Unique)
+          Write-Host "顶层条目: $($tops -join ', ')"
+          if ($tops.Count -ne 1 -or $tops[0] -ne 'perfstat-windows') {
+            Write-Error "zip 顶层应该只有 perfstat-windows/ 一个条目"
             exit 1
           }
 
@@ -299,8 +324,10 @@ jobs:
           set -e
           ls -R artifacts
           rm -rf bundle && mkdir -p bundle
-          # 每个平台的 zip 解开后是一层同名目录（perfstat-windows / perfstat-linux），
-          # 直接解到 bundle/ 下即可，于是 bundle/ 里就是那两个目录。
+          # 两个平台的 zip 结构【刻意保持一致】：解开后各是一层与 zip 同名的目录
+          #   perfstat-windows/{addons,tests,README.md}
+          #   perfstat-linux/{addons,tests,README.md}
+          # 所以统一解到 bundle/ 下即可，bundle/ 里就是那两个目录。
           unzip -q -o artifacts/perfstat-windows/perfstat-windows.zip -d bundle
           unzip -q -o artifacts/perfstat-linux/perfstat-linux.zip -d bundle
           # 校验：bundle 里不应该有 zip，且两个平台的关键文件都在
