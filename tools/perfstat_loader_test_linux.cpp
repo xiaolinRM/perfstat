@@ -650,6 +650,27 @@ int main(int argc, char **argv) {
     int dlrc = dlclose(so);
     CHECK(dlrc == 0, "dlclose 成功卸载（采样线程已收干净，没有线程跑在已卸载代码上）");
 
+    //----------------------------------------------------------------------------------------
+    // 关键验证：卸载后这个 SO 【仍然留在内存里】
+    //
+    // 插件在 Unload() 结尾会给自己 +1 引用计数（dlopen 自己），所以宿主/引擎随后的
+    // dlclose 扣不掉它。这是刻意的：一旦 SO 真被 unmapped，引擎侧任何残留指针
+    // （命令对象、名字字符串、命令链表节点）被访问就是崩溃 —— 典型症状是
+    // plugin_unload 之后在客户端输入框打一个字就崩（崩溃点 gameui.dll，读 NULL）。
+    //
+    // 这里用 RTLD_NOLOAD 探测"是否还在"（只查询，不增加引用）。
+    //----------------------------------------------------------------------------------------
+    {
+        void *still = dlopen(so_path, RTLD_NOW | RTLD_NOLOAD);
+        CHECK(still != 0, "卸载后 SO 仍在内存中（keep_mapped 生效，引擎残留指针不会崩）");
+        if (still) {
+            typedef long (*HandlerRunsFn2)(void);
+            HandlerRunsFn2 hr = (HandlerRunsFn2)dlsym(still, "perfstat_ps_handler_runs");
+            CHECK(hr != 0, "留存下来的 SO 里导出函数仍可解析（代码未被 unmapped）");
+            if (hr) printf("  留存 SO 的 perfstat_ps_handler_runs() = %ld（代码确实还在）\n", hr());
+        }
+    }
+
     alarm(0);
     fprintf(stderr, "[loader] 全部阶段完成\n");
     printf("\n================================================================================\n");

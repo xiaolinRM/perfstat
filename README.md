@@ -1,10 +1,16 @@
 # perfstat —— 服务器进程内 CPU / 内存分析插件（纯引擎插件）
 
-一个**直接由游戏引擎加载**的服务器插件，用法和 `l4dtoolz` 一样：
+一个**直接由游戏引擎加载**的服务器插件，和 `l4dtoolz` 一样靠 `.vdf` 自动加载：
 
 ```
-plugin_load perfstat
+left4dead2/addons/
+├── perfstat.vdf      # 自动加载配置
+├── perfstat.ini      # 可选配置
+└── perfstat.dll      # Windows 产物（Linux 则是 perfstat.so）
 ```
+
+把这几个文件放进 `addons/`，**下次开服就会自动加载**，不需要输入任何指令。
+详见 [3. 安装与加载](#3-安装与加载)。
 
 - **不依赖 metamod**、**不依赖 sourcemod**
 - **不需要 hl2sdk 就能编译**（自带一份与官方 SDK 逐字对齐的最小 ABI 头文件）
@@ -160,21 +166,34 @@ left4dead2/
 所以 **Linux 产物必须正好叫 `perfstat.so`**，写成别的名字（例如服务端自带的 `_srv` 那种）
 自动加载会找不到。
 
+> **`.vdf` 必须放在 `addons/` 里面**，不能放到 `addons/` 的上一级（即 `left4dead2/` 下）。
+> 引擎启动时只扫 `addons/*.vdf`，位置不对就不会被加载。
+> 但 `"file"` 里的路径**要带 `addons/` 前缀**（`addons/perfstat`）——
+> 这个路径是相对 `left4dead2/` 的。两者一个是"文件放哪"、一个是"路径怎么写"，别搞混。
+
 放好之后**下次开服就会自动加载**，不需要手动输入任何指令。
 控制台可以用 `plugin_print` 确认列表里有 perfstat。
 
 > 分隔符必须是**制表符**（tab），键和值都要加引号，`addons/` 用正斜杠。
 
-### 3.2 手动加载（临时用 / 调试用）
+### 3.2 手动加载（可选；日常不需要）
+
+`.vdf` 已经能自动加载，所以下面这条**只在"不想重启服务器、想立刻加载"时**才用。
+注意路径要写**相对 `left4dead2/` 的完整路径**（也就是和 `.vdf` 里 `"file"` 那一行完全一致）：
 
 ```
-plugin_print                :: 顺便确认插件列表里有 perfstat
-plugin_load perfstat        :: 也可以写 plugin_load addons/perfstat
+plugin_load addons/perfstat      :: 对；和 vdf 里的 "file" 写法一样
+plugin_load perfstat             :: 错；这样会报 Unable to load plugin
+perf_print                       :: 确认插件列表里有 perfstat（老版本引擎是 plugin_print）
 perf_help
 ```
 
-加载成功后控制台会打印一段说明。如果 `plugin_load` 报 `Unable to load plugin`，
-先确认位数是 32 位（见上一节）。
+**.vdf 和指令的路径为什么是同一个**：`.vdf` 里写 `"file" "addons/perfstat"`，
+而引擎解析这条指令时用的也是同一个基名规则 —— 所以插件放在 `addons/` 下时，
+两者都写 `addons/perfstat`（**不带扩展名**，引擎自己按平台拼 `.dll` / `.so`）。
+
+加载成功后控制台会打印一段说明。如果报 `Unable to load plugin`，
+先确认位数是 32 位（见上一节），再确认路径里带了 `addons/`。
 
 > **卸载注意**：`plugin_unload` 之后插件会**刻意保留控制台命令对象的内存**（不 free）。
 > 这是有意为之，不是泄漏 bug —— 因为引擎侧的 ConCommandBase 链表可能仍持有这些对象，
@@ -435,18 +454,51 @@ delete p;      // ← 问题在这里
 
 这解释了为什么是"打字才崩"：不按键就不会去遍历补全。
 
-**修法**：卸载时**只反注册、不释放**命令对象的内存（名字字符串也保留）。
-这点内存（10 条命令、几百字节）就是插件唯一的"泄漏"，而插件卸载后进程通常马上就要
-结束（换图/关服），代价可忽略。**宁可留着，也不能把悬空指针交给引擎** ——
-这是所有引擎插件的通行做法。
+**修法（分两层，都要做）**：
 
-> 原来的代码还有第二个隐患：边遍历边 `delete`，而 `next = p->GetNext()` 是从
-> **已经/即将释放**的对象里读出来的。现在整段删掉，一并消除。
+**第一层（v1.5.0）：不释放命令对象。** 卸载时只反注册、不 `delete`，
+名字字符串也保留。原来的代码还有第二个隐患：边遍历边 `delete`，而
+`next = p->GetNext()` 是从**已经/即将释放**的对象里读出来的 —— 整段删掉一并消除。
+
+**第二层（v1.6.0，根治）：让模块卸载后仍留在内存里。**
+第一层做完后用户实测**仍然崩溃**，于是用崩溃转储重新定位，拿到了更精确的数据：
+
+```
+ThreadId         = 19316
+ExceptionCode    = 0xC0000005  (ACCESS_VIOLATION)
+ExceptionAddress = 0x513D9D03  ->  gameui.dll+0xE9D03
+NumberParameters = 0
+```
+
+两次崩溃的 `ExceptionAddress` **完全相同**，且落在 `gameui.dll`（游戏 UI，输入框所在）。
+这说明问题不在"我们释放了内存"，而在 **`plugin_unload` 把我们的 DLL 从进程里
+unmapped 掉了**：此后引擎侧任何指向我们内存的指针（命令对象、名字字符串、
+命令链表节点）一被访问就是"访问未映射内存"。
+
+**引擎的插件接口没有"卸载时通知引擎清理引用"的机制**，所以插件侧唯一可靠的自保
+办法就是**让模块别真的被卸掉**：
+
+- Windows：`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, 本函数地址, &self)`
+  给本模块 +1 引用计数，引擎随后调用的 `FreeLibrary` 扣不掉我们。
+- Linux：`dlopen(自己, RTLD_NOW|RTLD_NOLOAD)` 同样 +1 引用计数。
+
+开关是 `perfstat.ini` 里的 `keep_mapped`（**默认 1**）。代价是卸载后代码/数据仍占
+几百 KB 常驻内存；插件卸载后进程通常马上要结束（换图/关服），这点代价换来的是不再崩溃。
+想恢复"真正卸载"就设 0（会有上述崩溃风险）。
+
+> 自检里有一条断言专门验证这件事：卸载后 `dlopen(RTLD_NOLOAD)` 还能找到这个 SO，
+> 并且从里面解析出导出函数并成功调用 —— 代码确实没被 unmapped。
 
 **Q：`plugin_load perfstat` 提示 `Unable to load plugin`？**
-确认是 32 位 DLL（`dumpbin /headers perfstat.dll` 看 `machine (x86)`），
-并且文件确实在 `addons/` 目录下。Linux 上还要确认产物名是 **`perfstat.so`**
-（`.vdf` 里写的是不带扩展名的基名 `addons/perfstat`，引擎自己拼 `.so`）。
+最常见的原因是**路径没带 `addons/` 前缀**：插件在 `addons/` 下时必须写
+`plugin_load addons/perfstat`（和 `.vdf` 里 `"file"` 的写法一致，不带扩展名）。
+
+其次确认：
+
+- 是 32 位产物（`dumpbin /headers perfstat.dll` 看 `machine (x86)`）
+- Linux 上产物名必须是 **`perfstat.so`**（`.vdf` 写的是基名 `addons/perfstat`，
+  引擎自己拼 `.so`；写成 `perfstat_srv.so` 之类会找不到）
+- 日常其实**不需要**这条指令 —— 放好 `.vdf` 后开服会自动加载，用 `perf_print` 确认即可
 
 **Q：加载成功但 `perf_stat` 报 `Unknown command`？**
 说明指令没注册上（拿不到 `VEngineCvar007`）。看加载时的输出有没有
@@ -776,7 +828,7 @@ profiler 样本数有没有增长**。真实服务器里插件只有一份副本
 - **Windows 上 listen server 的控制台表现**：输出通道已经改成 `ICvar::ConsolePrintf`，
   但最终效果要你在真机上确认一次（见下面的 FAQ）。
 
-反馈方式：`plugin_load perfstat` 之后执行一次 `perf_selftest`，
+反馈方式：加载插件后执行一次 `perf_selftest`，
 把控制台内容发回来，我按实际情况调。
 
 ---

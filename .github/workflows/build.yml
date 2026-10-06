@@ -90,20 +90,60 @@ jobs:
           echo [OK] perfstat_loader_test.exe passed
 
       # ---- 打包 ----
+      # 目录结构照 Source 插件的通行做法：vdf 和 dll 都放在 addons/ 里面。
+      #
+      # 注意【不要让 zip 里再套一层同名 zip】：
+      #   原来用 Compress-Archive -Path dist\perfstat-windows 会把整个目录（"目录"本身是顶层条目）
+      #   压进去，上传时再被 runner 包一层，解压出来就会是 "文件夹/又一层"。
+      #   所以这里先 cd 进目录再压里面的内容（-Path .\* ），这样解压出来直接就是文件。
       - name: 打包 Windows 产物
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist\perfstat-windows\addons | Out-Null
-          New-Item -ItemType Directory -Force -Path dist\perfstat-windows\tests  | Out-Null
-          Copy-Item build\perfstat.dll -Destination dist\perfstat-windows\addons\
-          Copy-Item perfstat.vdf,perfstat.ini,README.md -Destination dist\perfstat-windows\
+
+          # 插件本体 + 自动加载配置 + 示例配置：全部放进 addons/
+          Copy-Item build\perfstat.dll   -Destination dist\perfstat-windows\addons\
+          Copy-Item perfstat.vdf         -Destination dist\perfstat-windows\addons\
+          Copy-Item perfstat.ini         -Destination dist\perfstat-windows\addons\
+          Copy-Item README.md            -Destination dist\perfstat-windows\
+
+          # 自检程序与日志单独放 tests/，不要跟插件本体混在一起
+          New-Item -ItemType Directory -Force -Path dist\perfstat-windows\tests | Out-Null
           Copy-Item build\perfstat_tests.exe,build\perfstat_loader_test.exe -Destination dist\perfstat-windows\tests\
           Copy-Item build\selftest.log,build\loader_test.log -Destination dist\perfstat-windows\tests\
-          Compress-Archive -Path dist\perfstat-windows -DestinationPath dist\perfstat-windows.zip -Force
-          Get-ChildItem -Recurse dist | Select-Object FullName
 
+          Push-Location dist
+          # 只压目录里的内容，确保 zip 解开后直接看到 addons/ 和 README.md
+          Compress-Archive -Path .\perfstat-windows\* -DestinationPath perfstat-windows.zip -Force
+          Pop-Location
+
+          # 校验：zip 里不应该再出现任何 .zip 条目
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path dist\perfstat-windows.zip))
+          $entries = $z.Entries | ForEach-Object { $_.FullName }
+          $z.Dispose()
+          Write-Host "zip 条目:"
+          $entries | ForEach-Object { Write-Host "  $_" }
+          if ($entries -match '\.zip$') {
+            Write-Error "zip 里还嵌套了 zip！"
+            exit 1
+          }
+          if (-not ($entries -match 'addons/perfstat\.dll')) {
+            Write-Error "zip 里没有 addons/perfstat.dll"
+            exit 1
+          }
+          if (-not ($entries -match 'addons/perfstat\.vdf')) {
+            Write-Error "zip 里没有 addons/perfstat.vdf"
+            exit 1
+          }
+
+      # 【只上传 zip 文件本身】不要把 dist/ 整个目录传上去 ——
+      # dist/ 里同时有解包目录 perfstat-windows/，一起上传的话 runner 会把两者都收进
+      # artifact（artifact 本身也是个 zip），于是用户下载解压后：
+      #   artifact.zip -> perfstat-windows.zip -> perfstat-windows/ 文件
+      # 就是"解压后还是同名 zip、再解压才是文件夹"的来源。
       - name: 上传 Windows 产物
         uses: actions/upload-artifact@v4
         with:
@@ -182,22 +222,49 @@ jobs:
           echo "Linux 加载自检通过"
 
       # ---- 打包 ----
+      # 目录结构照 Source 插件的通行做法：vdf 和 .so 都放在 addons/ 里面。
+      #
+      # 关于 zip 嵌套：用 `zip -r out.zip <dir>` 会把 dir 自己作为顶层条目写进 zip，
+      # 解开就是 "perfstat-linux/..."，这本身是对的（一层目录，不是嵌套 zip）。
+      # 真正造成"解压后还是 zip"的是上传了【两个 artifact】都要手动解压，
+      # 以及汇总包里又打了一次 zip。这里统一成：产物 zip 里只有一层目录，
+      # 并且校验 zip 内不含任何 .zip 条目。
       - name: 打包 Linux 产物
         run: |
           set -e
           rm -rf dist
           mkdir -p dist/perfstat-linux/addons dist/perfstat-linux/tests
-          cp Release/perfstat.so dist/perfstat-linux/addons/
-          cp perfstat.vdf perfstat.ini README.md dist/perfstat-linux/
+          cp Release/perfstat.so            dist/perfstat-linux/addons/
+          cp perfstat.vdf perfstat.ini      dist/perfstat-linux/addons/
+          cp README.md                      dist/perfstat-linux/
           cp build/perfstat_loader_test_linux build/perfstat_smoke_linux dist/perfstat-linux/tests/
-          cp build/loader_test_linux.log build/smoke_linux.log       dist/perfstat-linux/tests/
+          cp build/loader_test_linux.log build/smoke_linux.log           dist/perfstat-linux/tests/
           cd dist && zip -r perfstat-linux.zip perfstat-linux
+          echo "--- zip 条目（应只有一层目录，且没有 .zip）---"
+          unzip -l perfstat-linux.zip
+          # 注意：必须用 -Z1（只列条目名）来判断嵌套。
+          # 用 `unzip -l | grep '\.zip$'` 会把第一行 "Archive: perfstat-linux.zip" 也算进去，
+          # 于是永远误报"嵌套了 zip"（踩过）。
+          if unzip -Z1 perfstat-linux.zip | grep -qE '\.zip$'; then
+            echo "::error::zip 里嵌套了 zip"
+            unzip -Z1 perfstat-linux.zip | grep -E '\.zip$'
+            exit 1
+          fi
+          unzip -Z1 perfstat-linux.zip | grep -q 'addons/perfstat.so' || {
+            echo "::error::zip 里没有 addons/perfstat.so"; exit 1; }
+          unzip -Z1 perfstat-linux.zip | grep -q 'addons/perfstat.vdf' || {
+            echo "::error::zip 里没有 addons/perfstat.vdf"; exit 1; }
+          # 顶层必须只有一个目录（避免又多一层）
+          tops=$(unzip -Z1 perfstat-linux.zip | cut -d/ -f1 | sort -u | wc -l)
+          echo "顶层条目数: $tops"
+          test "$tops" = "1" || { echo "::error::zip 顶层不止一个条目"; exit 1; }
           # 注意：上面已经 cd 进 dist 了，这里只能 ls 当前目录。
           # 原来写的是 `ls -lR dist`，在 dist 里再找 dist 必然失败，
           # 而 set -e 会让整个打包步骤以退出码 2 结束（zip 其实已经成功了）。
           ls -lR .
           echo "zip 大小: $(stat -c %s perfstat-linux.zip) 字节"
 
+      # 同上：只传 zip，不传 dist/ 目录
       - name: 上传 Linux 产物
         uses: actions/upload-artifact@v4
         with:
@@ -222,18 +289,36 @@ jobs:
         with:
           path: artifacts
 
+      # 汇总包：把两个平台的产物解到 bundle/ 里，再打成【一个】zip。
+      #
+      # 关于"解压后还是 zip"：以前是 artifacts/ 下每个 artifact 一个 zip，用户要先解压
+      # artifact 再解压里面的 zip，共两层；而汇总包又把这两个 zip 再包一层。
+      # 现在统一成：汇总包解开就是 windows/ 和 linux/ 两个目录，直接能用。
       - name: 合并成一个总包
         run: |
           set -e
           ls -R artifacts
-          mkdir -p bundle
-          # 把两个 zip 都解开放进同一个目录树，同时保留原始 zip
-          cd bundle
-          unzip -o ../artifacts/perfstat-windows/perfstat-windows.zip
-          unzip -o ../artifacts/perfstat-linux/perfstat-linux.zip
-          cp ../README.md ../perfstat.ini . 2>/dev/null || true
-          cd ..
-          zip -r perfstat-all-platforms.zip bundle
+          rm -rf bundle && mkdir -p bundle
+          # 每个平台的 zip 解开后是一层同名目录（perfstat-windows / perfstat-linux），
+          # 直接解到 bundle/ 下即可，于是 bundle/ 里就是那两个目录。
+          unzip -q -o artifacts/perfstat-windows/perfstat-windows.zip -d bundle
+          unzip -q -o artifacts/perfstat-linux/perfstat-linux.zip -d bundle
+          # 校验：bundle 里不应该有 zip，且两个平台的关键文件都在
+          if find bundle -name '*.zip' | grep -q .; then
+            echo "::error::汇总目录里残留了 zip"; find bundle -name '*.zip'; exit 1
+          fi
+          test -f bundle/perfstat-windows/addons/perfstat.dll || {
+            echo "::error::缺 windows 插件"; exit 1; }
+          test -f bundle/perfstat-windows/addons/perfstat.vdf || {
+            echo "::error::缺 windows vdf"; exit 1; }
+          test -f bundle/perfstat-linux/addons/perfstat.so || {
+            echo "::error::缺 linux 插件"; exit 1; }
+          test -f bundle/perfstat-linux/addons/perfstat.vdf || {
+            echo "::error::缺 linux vdf"; exit 1; }
+          # 从 bundle 内部打包，zip 里顶层就是那两个目录（不多一层、不套 zip）
+          cd bundle && zip -r ../perfstat-all-platforms.zip . && cd ..
+          echo "--- 汇总包条目 ---"
+          unzip -l perfstat-all-platforms.zip | head -30
           ls -l perfstat-all-platforms.zip
 
       - name: 上传总包

@@ -39,6 +39,8 @@
 
 #include "platform.h"
 
+#include <dlfcn.h>
+
 // 【本文件自给自足】诊断用的相对时间戳（毫秒）。
 //
 // 为什么不用 core.cpp 里的 ps_dbg_now_ms：
@@ -923,6 +925,43 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 }
 
 void ps_set_debug(int on) { __atomic_store_n(&g_ps_debug, on ? 1 : 0, __ATOMIC_RELEASE); }
+
+// 见 platform.h 的说明。Linux 这边用 dlopen(自己) 把引用计数 +1，
+// 引擎随后的 dlclose 扣不掉，SO 就保持映射。需要 -ldl（已在链接参数里）。
+bool ps_keep_module_mapped() {
+    // 从 /proc/self/maps 里找出包含本函数的那个文件映射，拿到自己的路径
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    unsigned long self_addr = (unsigned long)(uintptr_t)&ps_keep_module_mapped;
+    char line[1024];
+    char path[768];
+    path[0] = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+        if (self_addr < lo || self_addr >= hi) continue;
+        char *slash = strchr(line, '/');
+        if (!slash) continue;
+        // 去掉行尾换行
+        char *nl = strchr(slash, '\n');
+        if (nl) *nl = 0;
+        size_t n = strlen(slash);
+        if (n >= sizeof(path)) n = sizeof(path) - 1;
+        memcpy(path, slash, n);
+        path[n] = 0;
+        break;
+    }
+    fclose(f);
+    if (!path[0]) return false;
+    void *h = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+    if (h) {
+        // RTLD_NOLOAD 只会在"已加载"时返回句柄并 +1 引用；我们刻意不 dlclose
+        return true;
+    }
+    // RTLD_NOLOAD 不支持时退一步：正常 dlopen 一次（也会 +1 引用，且不释放）
+    h = dlopen(path, RTLD_NOW);
+    return h != 0;
+}
 
 // 诊断用：本副本的信号处理器一共运行了多少次。
 // 自检拿它来判断"进程里实际生效的处理器是哪一份副本的"。

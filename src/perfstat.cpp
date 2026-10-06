@@ -505,6 +505,7 @@ struct Config {
     bool auto_start;    // 插件加载后是否自动开始采样
     int auto_dump_sec;  // 自动落盘周期（0=关闭）
     std::string auto_dump_path;
+    bool keep_mapped;   // 卸载后是否刻意让本模块留在内存（默认 1，见下面说明）
 
     Config()
         : sample_ms(10),
@@ -515,7 +516,8 @@ struct Config {
           show_hot(false),
           show_threads(false),
           auto_start(true),
-          auto_dump_sec(0) {}
+          auto_dump_sec(0),
+          keep_mapped(true) {}
 };
 
 Config g_config;
@@ -571,6 +573,8 @@ void load_config_file(const std::string &path) {
             g_config.show_threads = parse_bool(val, g_config.show_threads);
         else if (!strcasecmp(key, "auto_start"))
             g_config.auto_start = parse_bool(val, g_config.auto_start);
+        else if (!strcasecmp(key, "keep_mapped"))
+            g_config.keep_mapped = parse_bool(val, g_config.keep_mapped);
         else if (!strcasecmp(key, "auto_dump_sec"))
             g_config.auto_dump_sec = parse_int(val, g_config.auto_dump_sec);
         else if (!strcasecmp(key, "auto_dump_path"))
@@ -776,6 +780,28 @@ void PerfStatPlugin::Unload(void) {
     }
     ps_platform_shutdown();
     vlog("Unload: platform shutdown done");
+
+    //----------------------------------------------------------------------------------------
+    // 最后一步：把本模块"锁"在内存里（见 platform.h 里 ps_keep_module_mapped 的详细说明）。
+    //
+    // 必须放在最后：前面该清理的都已经清理完了，此时再做"留存"才不影响卸载流程本身。
+    //
+    // 为什么非做不可：引擎的插件接口【没有】"卸载时通知引擎清理引用"的机制。
+    // 一旦模块被 unmapped，引擎侧任何残留指针（ConCommand、名字字符串、链表节点）
+    // 被访问就是崩溃。实测症状是 plugin_unload 之后在客户端输入框打一个字就崩，
+    // 崩溃点 gameui.dll、读 NULL。
+    //
+    // 想恢复"真正卸载"（会有上述崩溃风险）就把 perfstat.ini 里 keep_mapped 设成 0。
+    //----------------------------------------------------------------------------------------
+    if (g_config.keep_mapped) {
+        bool kept = ps_keep_module_mapped();
+        vlog("Unload: keep_mapped=%d (%s)", (int)kept,
+             kept ? "模块保留在内存，避免引擎残留指针引发崩溃"
+                  : "失败！引擎会真正卸载本模块，之后可能有悬空指针风险");
+    } else {
+        vlog("Unload: keep_mapped=0，按配置真正卸载（引擎残留指针可能导致崩溃）");
+    }
+
     console_out("[perfstat] 已卸载\n");
     vlog("Unload: end");
 }

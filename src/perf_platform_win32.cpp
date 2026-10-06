@@ -743,6 +743,19 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 //----------------------------------------------------------------------------------------
 void ps_set_debug(int on) { InterlockedExchange((volatile LONG *)&g_ps_debug, on ? 1 : 0); }
 
+// 见 platform.h 的说明：给本模块 +1 引用计数，让引擎后续的 FreeLibrary 扣不掉我们，
+// 从而避免"卸载后引擎残留指针被访问 -> 崩溃"。
+// 用 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 从"本函数地址"反查模块句柄，
+// 这样不需要知道 DLL 路径，也不会因为路径写法不同而失败。
+bool ps_keep_module_mapped() {
+    HMODULE self = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (LPCWSTR)(const void *)&ps_keep_module_mapped, &self)) {
+        return self != 0;  // 引用计数已经 +1，且我们不释放
+    }
+    return false;
+}
+
 // Windows 不用信号采样，恒为 0（保持接口一致）
 long ps_handler_run_count(void) { return 0; }
 
