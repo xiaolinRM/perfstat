@@ -22,14 +22,36 @@
 
 #include "../src/platform.h"
 
-static volatile const char *g_phase = "start";
 static int g_timeout_sec = 60;
+
+// 看门狗用的阶段表。
+//
+// 踩过的坑：这里一开始写的是 `static volatile const char *g_phase`，想靠 volatile 让
+// 信号处理器读到最新值。实际上 `const char * volatile` 和 `volatile const char *` 是两回事，
+// 后者给"指向的内容"加了 volatile，于是 `const char *p = g_phase;` 会因为
+// "const volatile char* → const char*" 编译不过（gcc 报 -fpermissive）。
+// 正确做法：阶段名放静态字符串数组（静态存储期，永远不会悬空），
+// 只用一个 volatile sig_atomic_t 下标来同步，这才是信号处理器里该用的类型。
+static const char *g_phases[] = {
+    "start",
+    "安装闹钟",
+    "ps_platform_init",
+    "ps_enum_modules",
+    "ps_enum_threads",
+    "ps_sample_threads 单次",
+    "连续采样 100 轮",
+    "ps_symbols_open / ps_symbolize",
+    "完成",
+};
+static volatile sig_atomic_t g_phase_idx = 0;
 
 static const char kTimeoutPrefix[] = "\n[smoke] 超时！卡在阶段: ";
 
 static void on_alarm(int) {
     // 只用异步信号安全的东西（write 是异步信号安全的，printf 不是）
-    const char *p = g_phase;
+    int i = (int)g_phase_idx;
+    if (i < 0 || i >= (int)(sizeof(g_phases) / sizeof(g_phases[0]))) i = 0;
+    const char *p = g_phases[i];
     (void)!write(2, kTimeoutPrefix, sizeof(kTimeoutPrefix) - 1);
     (void)!write(2, p, strlen(p));
     (void)!write(2, "\n", 1);
@@ -37,7 +59,12 @@ static void on_alarm(int) {
 }
 
 static void phase(const char *p) {
-    g_phase = p;
+    for (size_t i = 0; i < sizeof(g_phases) / sizeof(g_phases[0]); ++i) {
+        if (strcmp(g_phases[i], p) == 0) {
+            g_phase_idx = (sig_atomic_t)i;
+            break;
+        }
+    }
     fprintf(stderr, "[smoke] 阶段: %s\n", p);
     fflush(stderr);
 }
