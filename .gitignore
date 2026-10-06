@@ -1,0 +1,23 @@
+# 构建产物
+build/
+Release/
+*.obj
+*.o
+*.so
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.map
+*.asm
+
+# 运行时生成的报告
+logs/
+*.log
+
+# 编辑器
+.vs/
+*.user
+*.suo

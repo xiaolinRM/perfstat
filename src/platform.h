@@ -1,0 +1,86 @@
+//========================================================================================
+// perfstat - 平台抽象层接口
+//
+// 上层（profiler / plugin）只依赖这里的抽象；Windows 与 Linux 的具体实现分别在
+// perf_platform_win32.cpp / perf_platform_linux.cpp 中。
+//========================================================================================
+
+#ifndef PERFSTAT_PLATFORM_H
+#define PERFSTAT_PLATFORM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace ps {
+
+// 一个模块（.dll / .so / 主程序）在内存中的映射信息
+struct ModuleInfo {
+    uintptr_t base;      // 基址
+    size_t size;         // 映射大小（虚拟）
+    char path[520];      // 完整路径
+    char name[160];      // 文件名（用于显示）
+    bool is_main;        // 是否主程序
+    size_t mapped_bytes;  // 内存统计：文件映射（等价于磁盘上的 DLL 自身）
+    size_t private_bytes; // 内存统计：私有提交（堆/栈/运行时分配）
+    size_t other_bytes;   // 内存统计：其它已提交（未驻留等）
+};
+
+struct ThreadInfo {
+    uint32_t tid;   // 线程 ID（进程内唯一，用它做线程身份即可）
+    char name[64];  // 线程名（拿不到时为空）
+    int priority;   // 优先级（辅助判断）
+};
+
+// 枚举结果的收集容器：平台层直接往里写，core 层再搬运到自己的统计表
+struct ModuleVisits {
+    ModuleInfo *items;
+    int count;
+    int capacity;
+};
+
+struct ThreadVisits {
+    ThreadInfo *items;
+    int count;
+    int capacity;
+};
+
+// ---- 生命周期 ----------------------------------------------------------------
+bool ps_platform_init();  // 进程级初始化（装信号处理器等），失败返回 false
+void ps_platform_shutdown();
+
+// ---- 枚举 --------------------------------------------------------------------
+void ps_enum_modules(ModuleVisits *out);  // 遍历本进程已加载模块
+void ps_enum_threads(ThreadVisits *out);  // 遍历本进程线程
+
+// ---- 采样 --------------------------------------------------------------------
+// 抓取一批线程“当前正在执行的指令地址”，写入 ips[]，线程 ID 写入 tids[]，
+// 返回实际抓到的数量。调用者随后自行做归因；平台层不持有 profiler 状态。
+int ps_sample_threads(uintptr_t *ips, uint32_t *tids, int max_ips);
+
+// 滑动窗口版：只抓窗口内的线程，cursor 跨轮次推进（线程很多时避免单次停顿过长）
+int ps_sample_threads_window(uintptr_t *ips, uint32_t *tids, int max_ips, int *cursor, int window);
+
+// ---- 内存 --------------------------------------------------------------------
+// 遍历本进程虚拟地址空间，把每一页按“归属模块”直接累加到传入的模块表里。
+// core 提供匹配函数：给定地址返回模块下标，-1 表示不属于任何模块。
+typedef int (*ModuleLookupFn)(uintptr_t addr, void *user);
+void ps_walk_memory(ModuleLookupFn lookup, void *user, ModuleInfo *mods, int mod_count);
+
+// ---- 符号解析 ----------------------------------------------------------------
+// 为某个模块解析导出表/符号表，返回一个不透明句柄（失败返回 0）。
+uintptr_t ps_symbols_open(const char *path, uintptr_t base);
+// 关闭句柄（插件卸载时调用）
+void ps_symbols_close(uintptr_t handle);
+// 取第 i 条符号；返回 false 表示越界。name 内存由平台层持有。
+bool ps_symbols_get(uintptr_t handle, int index, uint32_t *rva, const char **name);
+// 给定模块内偏移，返回最接近的符号名（可能为空）；offset 输出相对该符号的偏移。
+const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset);
+
+// ---- 杂项 --------------------------------------------------------------------
+double ps_now_seconds();  // 单调时钟（秒）
+void ps_get_local_time(int *y, int *mo, int *d, int *h, int *mi, int *s);
+const char *ps_platform_name();  // "win32" / "linux"
+
+}  // namespace ps
+
+#endif  // PERFSTAT_PLATFORM_H

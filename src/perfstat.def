@@ -1,0 +1,12 @@
+; perfstat.def —— 通常不需要这个文件
+;
+; 事实：在 32 位 MSVC 里用 __declspec(dllexport) 导出 extern "C" 函数时，链接器会
+;       自动把 _CreateInterface 按名字 CreateInterface 导出（验证过 dumpbin /exports）。
+;       引擎正是用 GetProcAddress("CreateInterface") 查找的，所以这个 .def 其实多余。
+;       这里保留成注释形式，避免误用过时的写法（写 "CreateInterface=_CreateInterface"
+;       在 x86 上会被 LNK4017 忽略，写 LIBRARY 行反而可能触发 LNK2001）。
+;
+; 如果将来遇到某个加载器非要按修饰名 _CreateInterface 查找，就把下面两行放开：
+;
+; EXPORTS
+;     _CreateInterface
