@@ -19,6 +19,12 @@
 #    【两份平台层副本】（自检一份、插件一份），信号处理器是进程级、后装覆盖先装的。
 #    所以这个程序【不要自己发起采样】—— 那会和插件的处理器抢槽位表。
 #    平台层的采样验证放在 perfstat_smoke_linux 里做（那里只有一份副本）。
+#
+# ⚠️ 第三个约束：因为不编 core.cpp，从插件里取到 Profiler* 之后，
+#    【只能调用 core.h 里的 inline 成员】（running / auto_stop_sec / total_samples /
+#    module_count / thread_count / sample_interval_ms / sample_errors），
+#    不能调用定义在 core.cpp 里的 elapsed_seconds()，否则链接期就报 undefined reference
+#    （两个坑都踩过）。
 #========================================================================================
 
 CXX      = g++
