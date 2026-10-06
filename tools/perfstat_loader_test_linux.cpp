@@ -388,7 +388,15 @@ int main(int argc, char **argv) {
         g_busy = 1;
         pthread_create(&bt, 0, busy_thread, 0);
 
+        // 带时间戳的阶段标记：stdout 是块缓冲、stderr 无缓冲，
+        // 日志里行号不代表时间顺序（这个坑吃过）。所以关键点都带时间戳。
+        typedef double (*NowFn)(void);
+        NowFn now_ms = (NowFn)dlsym(so, "perfstat_now_ms");
+        fprintf(stderr, "[loader] [%.0f ms] 准备 sleep(2)\n", now_ms ? now_ms() : -1.0);
+
         sleep(2);
+
+        fprintf(stderr, "[loader] [%.0f ms] sleep(2) 结束\n", now_ms ? now_ms() : -1.0);
 
         g_busy = 0;
         pthread_join(bt, 0);

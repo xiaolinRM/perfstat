@@ -58,6 +58,10 @@ bool g_perfstat_verbose = false;
 // 核心层的诊断开关（定义在 core.cpp；那里离线自检也会链接）
 extern "C" int g_perfstat_verbose_flag;
 
+// 定义在 core.cpp（core.h 里也有声明，但 perfstat.cpp 不包含 core.h）
+extern "C" double ps_dbg_now_ms(void);
+
+
 // 每行都带一个相对 Load 开始时刻的毫秒时间戳，
 // 这样一眼就能看出"哪一步花了多久"、"卡在哪一步"。
 static double g_vlog_t0 = -1.0;
@@ -99,6 +103,10 @@ extern "C" PS_DLL_EXPORT long perfstat_handler_runs(void) {
 extern "C" PS_DLL_EXPORT const char *perfstat_lock_holder(void) {
     return ps::g_profiler ? ps::g_profiler->lock_holder() : "";
 }
+
+// 自检用它给自己的关键点打时间戳，这样一次日志就能自证先后顺序
+// （stdout 块缓冲 + stderr 无缓冲，行号不代表时间顺序）。
+extern "C" PS_DLL_EXPORT double perfstat_now_ms(void) { return ps_dbg_now_ms(); }
 
 //----------------------------------------------------------------------------------------
 // 控制台输出

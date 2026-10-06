@@ -38,6 +38,9 @@
 
 #include "platform.h"
 
+// 统一诊断时间戳（定义在 perfstat.cpp）
+extern "C" double ps_dbg_now_ms(void);
+
 namespace ps {
 
 namespace {
@@ -732,10 +735,9 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
         dbg_t0 = dbg_t1;
         if (g_ps_debug && (dbg_calls < 2 || dbg_calls % 500 == 0)) {
             fprintf(stderr,
-                    "[perfstat-hb] ps_sample_window: tids=%d self=%d sig=%d handler_runs=%ld miss=%ld\n",
-                    total, (int)syscall(SYS_gettid), g_sig,
-                    (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED),
-                    (long)__atomic_load_n(&g_handler_miss, __ATOMIC_RELAXED));
+                    "[perfstat-hb] [%.0f ms] window: tids=%d self=%d sig=%d handler_runs=%ld\n",
+                    ps_dbg_now_ms(), total, (int)syscall(SYS_gettid), g_sig,
+                    (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED));
         }
         dbg_calls++;
     }

@@ -23,6 +23,21 @@ static const size_t kMaxHotPerModule = 4096;
 // （它需要在没有引擎的情况下驱动 profiler）。如果定义放插件里，自检就会链接失败。
 // 平台层用 extern "C" int g_perfstat_verbose_flag; 引用它。
 //----------------------------------------------------------------------------------------
+// 统一诊断时间戳（毫秒，进程启动起算）
+//
+// 定义放 core.cpp 而不是 perfstat.cpp：离线自检会编 core.cpp 但不编 perfstat.cpp，
+// 定义在后者会导致自检链接失败。
+
+// 为什么需要它：CI 日志里 stdout 是块缓冲（进程退出才刷）、stderr 无缓冲，
+// 两者交错后【行号完全不能代表时间顺序】—— 这个项目里因为误读顺序浪费过好几轮。
+//----------------------------------------------------------------------------------------
+extern "C" double ps_dbg_now_ms(void) {
+    static double base = 0.0;
+    double t = ps_now_seconds() * 1000.0;
+    if (base == 0.0) base = t;
+    return t - base;
+}
+//----------------------------------------------------------------------------------------
 // 先声明成 C 链接（符号名不能被 C++ 修饰），再用普通定义 ——
 // 直接写 `extern "C" int x = 0;` 会被 gcc 警告 "initialized and declared extern"。
 extern "C" int g_perfstat_verbose_flag;
@@ -251,8 +266,9 @@ void Profiler::sampler_loop() {
     int cursor = 0;
     int dbg_round = 0;
     if (verbose_on()) {
-        fprintf(stderr, "[perfstat-hb] sampler_loop enter: running=%d cap=%d threads=%d modules=%d\n",
-                (int)m_running, m_ip_capacity, (int)m_threads.size(), (int)m_modules.size());
+        fprintf(stderr,
+                "[perfstat-hb] [%.0f ms] sampler_loop enter: running=%d cap=%d threads=%d\n",
+                ps_dbg_now_ms(), (int)m_running, m_ip_capacity, (int)m_threads.size());
     }
     // 每轮都检查 ps_stop_requested()：插件卸载时会请求停止，
     // 这样采样线程能在毫秒级退出，而不是把当前这一轮跑完（可能几百毫秒）。
@@ -260,6 +276,10 @@ void Profiler::sampler_loop() {
         double t0 = ps_now_seconds();
 
         double t_s0 = ps_now_seconds();
+        if (verbose_on()) {
+            fprintf(stderr, "[perfstat-hb] [%.0f ms] round %d: calling window\n", ps_dbg_now_ms(),
+                    dbg_round);
+        }
         int n = ps_sample_threads_window(m_ip_buffer, m_tid_buffer, m_ip_capacity, &cursor,
                                          kSampleWindow);
         double t_s1 = ps_now_seconds();
@@ -267,16 +287,16 @@ void Profiler::sampler_loop() {
         // 正常应该只有毫秒级，一旦到了百毫秒以上就是严重问题，
         // 否则只会看到"某一轮之后就没动静了"，很容易误判成采样线程挂了。
         if ((t_s1 - t_s0) > 0.2) {
-            fprintf(stderr, "[perfstat-hb] SLOW 采样窗口: %.0f ms (n=%d, 线程=%d)\n",
-                    (t_s1 - t_s0) * 1000.0, n, (int)m_threads.size());
+            fprintf(stderr, "[perfstat-hb] [%.0f ms] SLOW 采样窗口: %.0f ms (n=%d, 线程=%d)\n",
+                    ps_dbg_now_ms(), (t_s1 - t_s0) * 1000.0, n, (int)m_threads.size());
         }
         // 低频心跳：只在 verbose 下每 100 轮打一行。
         // 这条日志能把"采样线程根本没进循环"和"进了循环但一个样本都拿不到"区分开。
         if (verbose_on() && (dbg_round < 2 || dbg_round % 500 == 0)) {
             fprintf(stderr,
-                    "[perfstat-hb] sampler round %d: n=%d total=%llu running=%d threads=%d\n",
-                    dbg_round, n, (unsigned long long)m_total_samples, (int)m_running,
-                    (int)m_threads.size());
+                    "[perfstat-hb] [%.0f ms] round %d done: n=%d total=%llu running=%d\n",
+                    ps_dbg_now_ms(), dbg_round, n, (unsigned long long)m_total_samples,
+                    (int)m_running);
         }
         dbg_round++;
         for (int i = 0; i < n; ++i) apply_sample(m_ip_buffer[i], m_tid_buffer[i]);
