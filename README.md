@@ -439,7 +439,17 @@ CPU% = 该模块命中采样数 / 总采样数
    现在改成"先请求停止（`ps_request_stop_sampling()`，让正在进行的采样在毫秒级放弃本轮），
    再耐心等待"，并且**绝不 detach**：宁可在日志里告警，也不制造野线程。
 
-5. **自检里两条断言本身写错了（v1.0.7 修）**
+5. **平台层引用了插件入口的全局变量（v1.0.7 修）**
+   为了让采样线程打心跳日志，平台层引用了 `g_perfstat_verbose_flag`（定义在 `core.cpp`）。
+   但 Linux 自检的 Makefile **只编平台层、不编 `core.cpp`**，于是直接
+   `undefined reference to 'g_perfstat_verbose_flag'` —— 编译都过不去。
+   现在平台层自持一个开关（`ps_set_debug()`），不再依赖 `core.cpp` 或插件入口的任何符号。
+
+   > 这条约束已经写进 `tools/Makefile.linux_tests` 的注释里：
+   > **`perf_platform_*.cpp` 只能依赖 `platform.h`**，改了平台层本地跑一下那个 Makefile
+   > 就能提前发现这类耦合问题。
+
+6. **自检里两条断言本身写错了（v1.0.7 修）**
    - "样本应落在本程序模块内"：忙循环原来内联在测试的线程函数里，被编译器优化后
      可能落到别的模块（实测跑到了 `perfstat_srv.so`），断言自然失败。
      现在把忙循环做成显式导出的函数，确保那段代码一定在测试程序自己的 `.text` 里。

@@ -8,6 +8,12 @@
 #
 # 自检程序需要用到平台层（模块枚举 / 采样）来交叉验证，所以直接编译
 # src/perf_platform_linux.cpp 进测试程序里（不是链接进 .so）。
+#
+# ⚠️ 注意：这里【只编平台层，不编 core.cpp】。所以 src/perf_platform_linux.cpp
+#    绝对不能引用 core.cpp 或插件入口里的全局变量/函数，否则会 undefined reference
+#    （踩过一次：平台层引用了 core.cpp 里的 g_perfstat_verbose_flag）。
+#    平台层自己的诊断开关是 ps_set_debug()，自持标志。
+#    如果你改了平台层，本地跑一下这个 Makefile 就能提前发现这类耦合问题。
 #========================================================================================
 
 CXX      = g++

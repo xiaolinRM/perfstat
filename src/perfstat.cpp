@@ -55,7 +55,7 @@ static ICvar *g_pCvar = 0;
 //----------------------------------------------------------------------------------------
 bool g_perfstat_verbose = false;
 
-// 平台层/核心层用的统一诊断开关（定义在 core.cpp，那里离线自检也会链接）
+// 核心层的诊断开关（定义在 core.cpp；那里离线自检也会链接）
 extern "C" int g_perfstat_verbose_flag;
 
 // 每行都带一个相对 Load 开始时刻的毫秒时间戳，
@@ -80,6 +80,7 @@ static void vlog(const char *fmt, ...) {
 extern "C" PS_DLL_EXPORT void perfstat_set_verbose(int on) {
     g_perfstat_verbose = (on != 0);
     g_perfstat_verbose_flag = (on != 0);
+    ps::ps_set_debug(on != 0);  // 平台层的诊断输出（它自持标志，不依赖我们的全局变量）
 }
 
 // 离线自检用它来读"插件自己的采样线程到底采了多少样本"。

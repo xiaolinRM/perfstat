@@ -29,9 +29,6 @@
 
 #include "platform.h"
 
-// 由 perfstat.cpp 导出（Windows 侧暂时没用到诊断，但保持符号一致）
-extern "C" int g_perfstat_verbose_flag;
-
 namespace ps {
 
 namespace {
@@ -51,6 +48,9 @@ namespace {
 HANDLE g_process = 0;
 bool g_wow64 = false;
 bool g_inited = false;
+
+// 平台层自己的诊断开关（与 Linux 侧接口一致）
+static volatile int g_ps_debug = 0;
 
 // "尽快停止采样"标志（与 Linux 侧语义一致）
 // 这个文件不包含 compat.h（它是纯 C 风格的平台实现），所以直接用 MSVC 内部函数。
@@ -741,6 +741,8 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 //----------------------------------------------------------------------------------------
 // 杂项
 //----------------------------------------------------------------------------------------
+void ps_set_debug(int on) { InterlockedExchange((volatile LONG *)&g_ps_debug, on ? 1 : 0); }
+
 // Windows 用 SuspendThread + GetThreadContext 取指令指针，不依赖信号，
 // 所以不需要"解开信号屏蔽"这一步。
 void ps_prepare_sampling_thread(void) {}

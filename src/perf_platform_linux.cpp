@@ -38,9 +38,6 @@
 
 #include "platform.h"
 
-// 由 perfstat.cpp 导出：离线自检打开 verbose 时置 1
-extern "C" int g_perfstat_verbose_flag;
-
 namespace ps {
 
 namespace {
@@ -73,6 +70,9 @@ bool g_inited = false;
 
 // "尽快停止采样"标志（原子读写，采样线程与插件主线程并发访问）
 static volatile int g_stop_sampling = 0;
+
+// 平台层自己的诊断开关。不要引用插件入口的全局变量（自检不编 core.cpp，会链接失败）。
+static volatile int g_ps_debug = 0;
 
 //----------------------------------------------------------------------------------------
 // 信号处理器
@@ -575,7 +575,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
 
         int tk = (int)syscall(SYS_tgkill, pid, tid, g_sig);
-        if (tk != 0 && g_perfstat_verbose_flag) {
+        if (tk != 0 && g_ps_debug) {
             fprintf(stderr, "[perfstat-hb] tgkill(tid=%d) FAILED rc=%d sig=%d\n", tid, tk, g_sig);
         }
         if (tk != 0) {
@@ -611,7 +611,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         }
         {
             static int dbg_slots = 0;
-            if (g_perfstat_verbose_flag && dbg_slots < 8) {
+            if (g_ps_debug && dbg_slots < 8) {
                 fprintf(stderr, "[perfstat-hb]   slot state=%d ip=%p tid=%d\n",
                         (int)__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE),
                         (void *)__atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE), tid);
@@ -645,7 +645,7 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     const int total = (int)tid_list.size();
     {
         static int dbg_calls = 0;
-        if (g_perfstat_verbose_flag && (dbg_calls < 3 || dbg_calls % 200 == 0)) {
+        if (g_ps_debug && (dbg_calls < 3 || dbg_calls % 200 == 0)) {
             fprintf(stderr, "[perfstat-hb] window: total_tids=%d window=%d self=%d sig=%d\n", total,
                     window, (int)syscall(SYS_gettid), g_sig);
         }
@@ -754,6 +754,8 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
     if (offset) *offset = (uint32_t)(rva - m->entries[best].value);
     return m->names[m->entries[best].name_index].c_str();
 }
+
+void ps_set_debug(int on) { __atomic_store_n(&g_ps_debug, on ? 1 : 0, __ATOMIC_RELEASE); }
 
 void ps_prepare_sampling_thread(void) {
     if (!g_inited) ps_platform_init();

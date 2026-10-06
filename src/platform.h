@@ -65,6 +65,13 @@ void ps_request_stop_sampling(void);
 // 采样线程应该在采样过程中间或周期性检查它；true 表示该尽快退出。
 bool ps_stop_requested(void);
 
+// 打开/关闭平台层的诊断输出（verbose 模式下会往 stderr 打采样细节）。
+//
+// 注意：这是【平台层自己的】开关，跟插件入口无关 —— 因为离线自检只编译
+// perf_platform_*.cpp，不编译 core.cpp；如果平台层直接引用插件里的全局变量，
+// 自检就会链接失败（踩过一次）。
+void ps_set_debug(int on);
+
 // 采样线程启动后第一件事就该调用它。
 //
 // 作用：把采样信号从"本线程"的信号掩码里解开。
