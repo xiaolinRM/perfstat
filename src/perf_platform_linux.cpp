@@ -58,8 +58,9 @@ namespace {
 //
 // 正确答案分两步：
 //   a) 槽位表是【全进程共享】的普通全局数组（跨线程可见），每个采样线程按 tid 独占一格；
-//   b) 处理器【不靠扫表定位】，而是读 thread_local 的"当前请求槽位指针"直接写
+//   b) 处理器【不靠扫表定位】，而是读一个全局的"当前请求槽位指针"直接写
 //      —— 这样即使进程里有多份本文件副本、处理器和发起者来自不同副本，也依然正确。
+//      （注意这个指针必须是【全局】而不是 thread_local，原因见它自己的注释。）
 //----------------------------------------------------------------------------------------
 const int kMaxSlots = 512;  // 槽位表总大小（够 512 个并发采样线程）
 
@@ -75,15 +76,21 @@ static thread_local int g_slot_index = -1;
 
 // 【关键】当前正在等待回填的槽位地址。
 //
-// 为什么必须用"指针"而不是让处理器自己去表里找：同一个进程里可能存在
+// 为什么用"指针"而不是让处理器自己去表里找：同一个进程里可能存在
 // 【多份本文件的副本】（perfstat_srv.so 一份、离线自检程序一份），
 // 每份各有自己的 g_slots 数组。信号处理器是进程级、后装覆盖先装的，
 // 于是处理器是 A 副本的、发起采样的是 B 副本 —— A 的处理器无论如何都扫不到
-// B 的槽位表（那是另一块内存），采样必然全部超时。
+// B 的槽位表（那是另一块内存）。传"地址"就没有这个问题：地址指向发起者的内存。
 //
-// 而"当前请求槽位的地址"通过 thread_local 传递：处理器运行在【发起采样的那个线程】上，
-// 读到的就是这个线程写下的地址，天然跨副本正确。
-static thread_local Slot *g_pending_slot = 0;
+// 【绝对不能加 thread_local】
+// 这是本文件第二个同类错误：处理器运行在【目标线程】上，读的是目标线程的 TLS。
+// 如果这个指针是 thread_local，采样线程写的是自己那份、处理器读的是目标线程那份（恒为 0），
+// 结果是处理器什么都不写、采样全部 20ms 超时、零样本。
+//
+// 用普通全局变量即可：采样是同一个采样线程串行发起的，
+// "同一个采样线程同一时刻只有一个请求"这个约束没有变，
+// 不同采样线程的请求时间窗互不重叠（各自 20ms 超时内必然结束并清零）。
+static Slot *volatile g_pending_slot = 0;
 
 int g_sig = -1;
 bool g_inited = false;
@@ -127,10 +134,11 @@ void ps_signal_handler(int, siginfo_t *, void *vctx) {
     ucontext_t *uc = (ucontext_t *)vctx;
     unsigned long ip = PS_UC_IP(uc);
 
-    // 直接写"发起采样的那个线程"正在等的槽位：地址通过 thread_local 传过来，
-    // 处理器运行在同一个线程上，所以这个指针一定指向正确的那张表
-    // （即使发起者和处理器来自不同副本也没问题）。
-    Slot *slot = g_pending_slot;
+    // 直接写"发起采样的那个线程"正在等的槽位：地址来自全局的 g_pending_slot，
+    // 一定指向发起者的那张槽位表（即使处理器和发起者来自不同副本也没问题）。
+    // 这里【不能】用 thread_local 读 —— 处理器运行在目标线程上，
+    // 目标线程的 TLS 里没有发起者写下的指针。
+    Slot *slot = (Slot *)__atomic_load_n((void *volatile *)&g_pending_slot, __ATOMIC_ACQUIRE);
     if (slot) {
         slot->ip = ip;
         __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
@@ -627,15 +635,16 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
 
         __atomic_store_n(&g_slots[idx].ip, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
-        // 告诉处理器"回填这一个槽位"（跨副本也正确）
-        g_pending_slot = &g_slots[idx];
+        // 告诉处理器"回填这一个槽位"（传地址，跨副本也正确）
+        __atomic_store_n((void *volatile *)&g_pending_slot, (void *)&g_slots[idx],
+                         __ATOMIC_RELEASE);
 
         int tk = (int)syscall(SYS_tgkill, pid, tid, g_sig);
         if (tk != 0 && g_ps_debug) {
             fprintf(stderr, "[perfstat-hb] tgkill(tid=%d) FAILED rc=%d sig=%d\n", tid, tk, g_sig);
         }
         if (tk != 0) {
-            g_pending_slot = 0;
+            __atomic_store_n((void *volatile *)&g_pending_slot, (void *)0, __ATOMIC_RELEASE);
             __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
             continue;
         }
@@ -666,7 +675,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
             tiny.tv_nsec = 200000;  // 0.2ms
             nanosleep(&tiny, 0);
         }
-        g_pending_slot = 0;
+        __atomic_store_n((void *volatile *)&g_pending_slot, (void *)0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
     }
     return count;
