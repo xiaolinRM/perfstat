@@ -38,12 +38,24 @@
 
 #include "platform.h"
 
-// 统一诊断时间戳（定义在 perfstat.cpp）
-extern "C" double ps_dbg_now_ms(void);
-
+// 【本文件自给自足】诊断用的相对时间戳（毫秒）。
+//
+// 为什么不用 core.cpp 里的 ps_dbg_now_ms：
+// 离线自检的 Makefile 只编平台层、不编 core.cpp，引用外部函数会链接失败
+// （这条约束已经踩过三次：g_perfstat_verbose_flag / elapsed_seconds / ps_dbg_now_ms）。
+// 平台层只能依赖 C 运行库和自己，所以这里自带一个 static 版本。
 namespace ps {
 
 namespace {
+
+static double ps_plat_now_ms() {
+    static double base = 0.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double t = ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+    if (base == 0.0) base = t;
+    return t - base;
+}
 
 //----------------------------------------------------------------------------------------
 // 采样槽位
@@ -736,7 +748,7 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
         if (g_ps_debug && (dbg_calls < 2 || dbg_calls % 500 == 0)) {
             fprintf(stderr,
                     "[perfstat-hb] [%.0f ms] window: tids=%d self=%d sig=%d handler_runs=%ld\n",
-                    ps_dbg_now_ms(), total, (int)syscall(SYS_gettid), g_sig,
+                    ps_plat_now_ms(), total, (int)syscall(SYS_gettid), g_sig,
                     (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED));
         }
         dbg_calls++;

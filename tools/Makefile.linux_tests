@@ -35,10 +35,35 @@ LIBS     = -lpthread -ldl
 
 SRCDIR    = src
 BINDIR    = build
+PLAT      = $(SRCDIR)/perf_platform_linux.cpp
 TARGET    = $(BINDIR)/perfstat_loader_test_linux
 SMOKE     = $(BINDIR)/perfstat_smoke_linux
 
-all: $(TARGET) $(SMOKE)
+#----------------------------------------------------------------------------------------
+# 防护网：平台层不能引用 core.cpp / 插件入口的符号
+#
+# 原因：本 Makefile 只编 src/perf_platform_linux.cpp，不编 core.cpp。
+# 一旦平台层引用了 core.cpp 或 perfstat.cpp 里的东西，链接期才会报 undefined reference，
+# 而这个错误在 Windows 侧永远测不出来（那边编了 core.cpp）。
+# 这条约束已经踩过三次：g_perfstat_verbose_flag / elapsed_seconds / ps_dbg_now_ms。
+#
+# 所以这里在构建前直接扫一遍源码，命中就立刻失败并给出清晰提示。
+#----------------------------------------------------------------------------------------
+PLAT_FORBIDDEN := ps_dbg_now_ms|g_perfstat_verbose_flag|elapsed_seconds|g_profiler|ps_dbg_lock
+
+.PHONY: check-platform-layering
+check-platform-layering:
+	@if grep -nE '$(PLAT_FORBIDDEN)' $(PLAT) | grep -v '^\s*//' | grep -vE '踩过|为什么不用|这条约束'; then \
+		echo ""; \
+		echo "!! 平台层引用了 core.cpp / 插件入口的符号（见上面几行）"; \
+		echo "!! 本 Makefile 只编平台层，不编 core.cpp —— 这会导致 undefined reference。"; \
+		echo "!! 平台层只能依赖 platform.h 和 C 运行库；诊断开关用 ps_set_debug()，"; \
+		echo "!! 时间戳之类的工具请在平台层内部自带一份 static 实现。"; \
+		exit 1; \
+	fi
+	@echo "OK: 平台层分层检查通过（没有引用 core.cpp / 插件入口的符号）"
+
+all: check-platform-layering $(TARGET) $(SMOKE)
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
@@ -51,7 +76,7 @@ $(SMOKE): tools/perfstat_smoke_linux.cpp $(SRCDIR)/perf_platform_linux.cpp | $(B
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "构建完成: $(SMOKE)"
 
-smoke: $(SMOKE)
+smoke: check-platform-layering $(SMOKE)
 
 clean:
 	rm -f $(TARGET) $(SMOKE)
