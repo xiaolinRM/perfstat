@@ -439,6 +439,14 @@ CPU% = 该模块命中采样数 / 总采样数
    现在改成"先请求停止（`ps_request_stop_sampling()`，让正在进行的采样在毫秒级放弃本轮），
    再耐心等待"，并且**绝不 detach**：宁可在日志里告警，也不制造野线程。
 
+5. **自检里两条断言本身写错了（v1.0.7 修）**
+   - "样本应落在本程序模块内"：忙循环原来内联在测试的线程函数里，被编译器优化后
+     可能落到别的模块（实测跑到了 `perfstat_srv.so`），断言自然失败。
+     现在把忙循环做成显式导出的函数，确保那段代码一定在测试程序自己的 `.text` 里。
+   - 用 `ps::g_profiler` 检查"插件自己采到多少样本"：在测试程序里那会解析成
+     **另一个同名变量**（初值 null），等于没测。现在插件明确导出
+     `perfstat_get_profiler()`，测试从动态符号表里取。
+
 顺带加了个**心跳日志**方便以后定位这类问题：离线自检会调用
 `perfstat_set_verbose(1)`，之后 `Load()` / `Unload()` 每一步都往 stderr 打一行带毫秒
 时间戳的记录：
@@ -451,7 +459,15 @@ CPU% = 该模块命中采样数 / 总采样数
 [perfstat-hb   2216.3 ms] Unload: profiler deleted
 ```
 
-一眼就能看出哪一步慢、卡在哪一步。
+一眼就能看出哪一步慢、卡在哪一步。采样线程自己也有低频心跳（每 100 轮一行）：
+
+```
+[perfstat-hb] sampler_loop enter: running=1 cap=64 threads=3 modules=9
+[perfstat-hb] sampler round 0: n=3 total=0
+[perfstat-hb] sampler round 100: n=3 total=300
+```
+
+这能把"采样线程根本没进循环"和"进了循环但一个样本都拿不到"直接区分开。
 
 另外自检里加了一条**关键断言**：插件自己的采样线程必须真的采到样本
 （通过导出的 `perfstat_get_profiler()` 读 `total_samples()`）。之前只断言"报告有输出"，

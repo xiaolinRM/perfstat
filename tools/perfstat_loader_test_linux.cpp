@@ -207,15 +207,28 @@ public:
 
 //----------------------------------------------------------------------------------------
 // 采样线程：让服务器"忙"起来，这样采样才有东西可采
+//
+// 注意：这次踩过一个坑 —— 原来忙循环直接内联在 busy_thread 里，
+// 编译器把它优化后可能落在别的模块（实测样本跑到了 perfstat_srv.so），
+// 于是"样本应落在本程序模块内"的断言就失败了。
+// 现在把它做成一个显式导出的函数，确保这段代码一定在测试程序自己的 .text 里。
 //----------------------------------------------------------------------------------------
 static volatile bool g_busy = false;
 static volatile unsigned long long g_sink = 0;
 
+extern "C" __attribute__((noinline, used, visibility("default"))) void perfstat_test_busy_loop(
+    unsigned spin) {
+    unsigned long long acc = 0;
+    for (unsigned i = 0; i < spin; ++i) {
+        acc += (unsigned long long)i * 2654435761u;
+        acc ^= acc >> 13;
+    }
+    g_sink += acc;
+}
+
 static void *busy_thread(void *) {
     while (g_busy) {
-        unsigned long long acc = 0;
-        for (unsigned i = 0; i < 1000000; ++i) acc += i * 2654435761u;
-        g_sink += acc;
+        perfstat_test_busy_loop(200000);
     }
     return 0;
 }

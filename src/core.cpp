@@ -16,6 +16,21 @@ namespace ps {
 // 每个模块最多记录多少个不同的热点偏移；超出后只累加 hot_capped
 static const size_t kMaxHotPerModule = 4096;
 
+//----------------------------------------------------------------------------------------
+// 调试/诊断开关：打开后采样线程会往 stderr 打低频心跳，方便定位"采不到样本"这类问题。
+//
+// 这个定义放在 core.cpp 而不是插件入口，是因为离线自检会直接编译 core.cpp
+// （它需要在没有引擎的情况下驱动 profiler）。如果定义放插件里，自检就会链接失败。
+// 平台层用 extern "C" int g_perfstat_verbose_flag; 引用它。
+//----------------------------------------------------------------------------------------
+// 平台层用 extern "C" int g_perfstat_verbose_flag; 引用它，所以这里也必须用 C 链接，
+// 否则符号会被 C++ 修饰成 _g_perfstat_verbose_flag，链接不上。
+extern "C" int g_perfstat_verbose_flag = 0;
+
+namespace {
+inline bool verbose_on() { return g_perfstat_verbose_flag != 0; }
+}
+
 Profiler::Profiler()
     : m_ip_buffer(0),
       m_tid_buffer(0),
@@ -214,8 +229,16 @@ void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
 // 所以这里做“滑动窗口”：每轮只抓 window 个线程，轮转覆盖，整体节拍仍按 interval_ms。
 static const int kSampleWindow = 24;
 
+// 由 perfstat.cpp 导出：离线自检打开 verbose 时置 1
+extern "C" int g_perfstat_verbose_flag;
+
 void Profiler::sampler_loop() {
     int cursor = 0;
+    int dbg_round = 0;
+    if (verbose_on()) {
+        fprintf(stderr, "[perfstat-hb] sampler_loop enter: running=%d cap=%d threads=%d modules=%d\n",
+                (int)m_running, m_ip_capacity, (int)m_threads.size(), (int)m_modules.size());
+    }
     // 每轮都检查 ps_stop_requested()：插件卸载时会请求停止，
     // 这样采样线程能在毫秒级退出，而不是把当前这一轮跑完（可能几百毫秒）。
     while (m_running && !ps_stop_requested()) {
@@ -223,6 +246,13 @@ void Profiler::sampler_loop() {
 
         int n = ps_sample_threads_window(m_ip_buffer, m_tid_buffer, m_ip_capacity, &cursor,
                                          kSampleWindow);
+        // 低频心跳：只在 verbose 下每 100 轮打一行。
+        // 这条日志能把"采样线程根本没进循环"和"进了循环但一个样本都拿不到"区分开。
+        if (verbose_on() && (dbg_round < 3 || dbg_round % 100 == 0)) {
+            fprintf(stderr, "[perfstat-hb] sampler round %d: n=%d total=%llu\n", dbg_round, n,
+                    (unsigned long long)m_total_samples);
+        }
+        dbg_round++;
         for (int i = 0; i < n; ++i) apply_sample(m_ip_buffer[i], m_tid_buffer[i]);
 
         double t1 = ps_now_seconds();

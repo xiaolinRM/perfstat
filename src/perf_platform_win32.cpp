@@ -29,6 +29,9 @@
 
 #include "platform.h"
 
+// 由 perfstat.cpp 导出（Windows 侧暂时没用到诊断，但保持符号一致）
+extern "C" int g_perfstat_verbose_flag;
+
 namespace ps {
 
 namespace {

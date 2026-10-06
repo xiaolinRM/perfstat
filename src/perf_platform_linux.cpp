@@ -38,6 +38,9 @@
 
 #include "platform.h"
 
+// 由 perfstat.cpp 导出：离线自检打开 verbose 时置 1
+extern "C" int g_perfstat_verbose_flag;
+
 namespace ps {
 
 namespace {
@@ -571,7 +574,11 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         __atomic_store_n(&g_slots[idx].ip, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
 
-        if (syscall(SYS_tgkill, pid, tid, g_sig) != 0) {
+        int tk = (int)syscall(SYS_tgkill, pid, tid, g_sig);
+        if (tk != 0 && g_perfstat_verbose_flag) {
+            fprintf(stderr, "[perfstat-hb] tgkill(tid=%d) FAILED rc=%d sig=%d\n", tid, tk, g_sig);
+        }
+        if (tk != 0) {
             __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
             continue;
         }
@@ -602,6 +609,15 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
             tiny.tv_nsec = 200000;  // 0.2ms
             nanosleep(&tiny, 0);
         }
+        {
+            static int dbg_slots = 0;
+            if (g_perfstat_verbose_flag && dbg_slots < 8) {
+                fprintf(stderr, "[perfstat-hb]   slot state=%d ip=%p tid=%d\n",
+                        (int)__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE),
+                        (void *)__atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE), tid);
+                dbg_slots++;
+            }
+        }
         __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
     }
     return count;
@@ -627,6 +643,14 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     static std::vector<int> tid_list;
     tid_list = list_tids();
     const int total = (int)tid_list.size();
+    {
+        static int dbg_calls = 0;
+        if (g_perfstat_verbose_flag && (dbg_calls < 3 || dbg_calls % 200 == 0)) {
+            fprintf(stderr, "[perfstat-hb] window: total_tids=%d window=%d self=%d sig=%d\n", total,
+                    window, (int)syscall(SYS_gettid), g_sig);
+        }
+        dbg_calls++;
+    }
     if (total <= 0) return 0;
     if (window <= 0 || window > max_ips) window = max_ips;
 
