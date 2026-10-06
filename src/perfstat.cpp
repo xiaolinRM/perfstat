@@ -94,6 +94,12 @@ extern "C" PS_DLL_EXPORT long perfstat_handler_runs(void) {
     return ps::ps_handler_run_count();
 }
 
+// 锁诊断：返回"谁握着 profiler 的锁"（返回空串表示没人持有）。
+// 采样线程卡住时用它判断是不是被锁挡住了。
+extern "C" PS_DLL_EXPORT const char *perfstat_lock_holder(void) {
+    return ps::g_profiler ? ps::g_profiler->lock_holder() : "";
+}
+
 //----------------------------------------------------------------------------------------
 // 控制台输出
 //

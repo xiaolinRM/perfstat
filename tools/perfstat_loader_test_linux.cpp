@@ -405,6 +405,15 @@ int main(int argc, char **argv) {
         }
         long ha = geth ? geth() : 0;
 
+        // 锁诊断：如果采样线程卡住，这里能看出是不是被锁挡住了
+        {
+            typedef const char *(*LockInfoFn)(void);
+            LockInfoFn holder = (LockInfoFn)dlsym(so, "perfstat_lock_holder");
+            if (holder) {
+                printf("  profiler 锁持有者: '%s'\n", holder());
+            }
+        }
+
         printf("  插件自身采样次数: %llu -> %llu（模块 %d / 线程 %d）\n", before, after, mods,
                threads);
         if (getp) {

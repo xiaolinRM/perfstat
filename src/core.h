@@ -21,26 +21,62 @@
 
 namespace ps {
 
+// 调试开关（定义在 core.cpp，插件和离线自检都会链接它）
+extern "C" int g_perfstat_verbose_flag;
+
 // 轻量自旋锁：采样线程写、主线程读，冲突极少
+//
+// 【诊断能力】自旋锁最大的风险是"某一边忘了放锁"或"持锁做了慢操作"，
+// 表现是另一个线程永久卡住、而且不报任何错（这个项目里踩过不止一次）。
+// 所以这里带着持有者记录：一旦有线程等待超过 50ms，就把"谁握着锁"打到 stderr。
 class SpinLock {
 public:
-    SpinLock() : m_flag(0) {}
+    SpinLock() : m_flag(0), m_owner("") {}
     void lock() {
+        if (PS_ATOMIC_SET(&m_flag, 1) == 0) return;
+        // 有人在等 —— 记录等待者，并在等太久时把持有者报出来
+        m_waiter = m_owner;
+        int spins = 0;
         while (PS_ATOMIC_SET(&m_flag, 1)) {
             while (PS_ATOMIC_GET(&m_flag)) {
+                if (++spins == 2000000) {
+                    // 大致对应几十毫秒。只报一次，避免刷屏。
+                    static volatile int reported = 0;
+                    if (g_perfstat_verbose_flag && !reported) {
+                        reported = 1;
+                        fprintf(stderr,
+                                "[perfstat-hb] LOCK STUCK: owner='%s' waiter='%s' (waited ~%dM spins)\n",
+                                m_owner, m_waiter, spins / 1000000);
+                    }
+                }
             }
         }
     }
-    void unlock() { PS_ATOMIC_SET(&m_flag, 0); }
-    bool try_lock() { return PS_ATOMIC_SET(&m_flag, 1) == 0; }
+    void unlock() {
+        m_owner = "";
+        PS_ATOMIC_SET(&m_flag, 0);
+    }
+    bool try_lock() {
+        if (PS_ATOMIC_SET(&m_flag, 1) == 0) return true;
+        return false;
+    }
+    // 调用者加锁成功后标记"我是谁"（AutoLock 会调用）
+    void set_owner(const char *who) { m_owner = who; }
+    const char *owner() const { return m_owner; }
+    const char *waiter() const { return m_waiter; }
 
 private:
     volatile long m_flag;
+    const char *m_owner;
+    const char *m_waiter;
 };
 
 class AutoLock {
 public:
-    explicit AutoLock(SpinLock &l) : m_l(l) { m_l.lock(); }
+    explicit AutoLock(SpinLock &l, const char *who = "?") : m_l(l) {
+        m_l.lock();
+        m_l.set_owner(who);
+    }
     ~AutoLock() { m_l.unlock(); }
 
 private:
@@ -161,6 +197,13 @@ private:
     void emit(const char *fmt, ...);
     void refresh_modules_and_threads();
     void collect_memory_locked();  // 调用前必须已经持有 m_lock
+
+public:
+    // 诊断用：当前握着统计锁的是谁（空串=没人持有）
+    const char *lock_holder() const { return m_lock.owner(); }
+    const char *lock_waiter() const { return m_lock.waiter(); }
+
+private:
 
     std::deque<ModuleStat> m_modules;
     std::vector<ThreadStat> m_threads;

@@ -79,7 +79,7 @@ void Profiler::refresh_modules_and_threads() {
     ps_enum_modules(&mv);
     ps_enum_threads(&tv);
 
-    AutoLock lk(m_lock);
+    AutoLock lk(m_lock, "refresh_threads");
     m_modules.clear();
     for (int i = 0; i < mv.count; ++i) {
         ModuleStat m;
@@ -136,7 +136,7 @@ void Profiler::reset() {
     bool was_running = m_running;
     if (was_running) set_running(false);
     {
-        AutoLock lk(m_lock);
+        AutoLock lk(m_lock, "refresh_modules");
         for (size_t i = 0; i < m_modules.size(); ++i) {
             ModuleStat &m = m_modules[i];
             m.hits = 0;
@@ -195,7 +195,7 @@ void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
         }
     }
 
-    AutoLock lk(m_lock);
+    AutoLock lk(m_lock, "apply_sample");
     if (!ip) {
         m_sample_errors++;
         return;
@@ -347,7 +347,8 @@ void Profiler::collect_memory_locked() {
 
     m_lock.unlock();  // ---- 放锁，做慢操作 ----
     ps_walk_memory(&mem_lookup, &ctx, result, count);
-    m_lock.lock();  // ---- 重新加锁，合并结果 ----
+    m_lock.lock();
+    m_lock.set_owner("report/collect_memory");  // ---- 重新加锁，合并结果 ----
 
     for (int i = 0; i < count && i < (int)m_modules.size(); ++i) {
         m_modules[i].mem_mapped = result[i].mapped_bytes;
@@ -357,7 +358,7 @@ void Profiler::collect_memory_locked() {
 }
 
 void Profiler::take_snapshot(Snapshot &s) {
-    AutoLock lk(m_lock);
+    AutoLock lk(m_lock, "take_snapshot");
 
     s.rows.clear();
     s.rows.reserve(m_modules.size());
@@ -413,7 +414,7 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
     // 之前是先 take_snapshot() 再 collect_memory_locked()，于是内存数据永远晚一拍
     // 才写进快照，报告里那一列永远是 0。
     if (!opt.no_memory) {
-        AutoLock lk(m_lock);
+        AutoLock lk(m_lock, "report/collect_memory");
         collect_memory_locked();
     }
     Snapshot s;
