@@ -22,7 +22,7 @@ CXX       = g++
 CXXFLAGS  = -m32 -std=c++11 -O2 -fPIC -fno-exceptions -fno-rtti -fno-strict-aliasing \
             -fvisibility=hidden -fvisibility-inlines-hidden -Wall -Wextra \
             -Wno-unused-parameter -DNDEBUG -DLINUX -D_stricmp=strcasecmp -D_strnicmp=strncasecmp
-LDFLAGS   = -m32 -shared -static-libgcc
+LDFLAGS   = -m32 -shared -rdynamic -static-libgcc
 LIBS      = -lpthread -ldl -lm
 
 SRCDIR    = src

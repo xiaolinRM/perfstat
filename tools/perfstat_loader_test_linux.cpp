@@ -32,6 +32,7 @@
 #include "../src/core.h"
 #include "../src/platform.h"
 
+
 static int g_fail = 0;
 static int g_pass = 0;
 
@@ -389,6 +390,28 @@ int main(int argc, char **argv) {
         if (cc) cc->Dispatch(c.cmd);
     }
     CHECK(g_fake_cvar.console_lines.size() > 20, "perf_dump / perf_top 都有控制台输出");
+
+    // 关键：插件【自己的采样线程】也必须真的采到样本。
+    // 之前只断言了"报告有输出"，结果插件 profiler 的采样次数其实是 0 却没被发现 ——
+    // 根因是采样线程继承了创建者的信号掩码，自己收不到采样信号。
+    //
+    // 注意：不能写 `extern Profiler *g_profiler;` 直接引用 —— 那在测试程序里会变成
+    // 另一个同名变量（初值 null），根本看不到插件内部的状态。必须从插件里查。
+    {
+        typedef void *(*GetProfilerFn)(void);
+        GetProfilerFn getp = (GetProfilerFn)dlsym(so, "perfstat_get_profiler");
+        CHECK(getp != 0, "插件导出了 perfstat_get_profiler");
+        if (getp) {
+            ps::Profiler *prof = (ps::Profiler *)getp();
+            CHECK(prof != 0, "插件内部 profiler 实例非空");
+            if (prof) {
+                unsigned long long total = (unsigned long long)prof->total_samples();
+                printf("  插件自身采样次数 = %llu（模块 %d / 线程 %d）\n", total,
+                       prof->module_count(), prof->thread_count());
+                CHECK(total > 0, "插件自己的采样线程确实采到了样本（信号掩码继承问题已修）");
+            }
+        }
+    }
 
     phase("Unload + dlclose");
     // ---- 7. Unload + dlclose ----

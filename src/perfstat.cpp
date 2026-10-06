@@ -76,6 +76,11 @@ static void vlog(const char *fmt, ...) {
 // 导出给离线自检用（名字带前后缀，避免和别的插件撞）
 extern "C" PS_DLL_EXPORT void perfstat_set_verbose(int on) { g_perfstat_verbose = (on != 0); }
 
+// 离线自检用它来读"插件自己的采样线程到底采了多少样本"。
+// 直接 dlsym("ps::g_profiler") 是不可靠的（那是变量，mangled 名字依赖编译器），
+// 所以明确导出一个函数。
+extern "C" PS_DLL_EXPORT void *perfstat_get_profiler(void) { return (void *)ps::g_profiler; }
+
 //----------------------------------------------------------------------------------------
 // 控制台输出
 //
@@ -276,6 +281,8 @@ volatile bool g_thread_alive = false;
 
 void sampler_entry() {
     g_thread_alive = true;
+    // 第一步：确保本线程能收到采样信号（掩码是继承来的，可能被创建者屏蔽了）
+    ps::ps_prepare_sampling_thread();
     while (!g_thread_stop) {
         if (ps::g_profiler && ps::g_profiler->running()) {
             ps::g_profiler->sampler_loop();
@@ -339,37 +346,49 @@ bool start_sampler_thread() {
 
 // 必须在 DLL 卸载前把采样线程收干净，否则线程会跑在已卸载的代码上直接崩服。
 //
-// 超时保护：正常情况下采样线程最多 50ms 就会看到停止标志退出。
-// 如果 5 秒还没退，说明它卡在采样循环里了 —— 这时候继续无限等下去只会让服务器
-// 挂死在 plugin_unload 上，所以打印警告后放弃等待（线程还在跑是有风险的，
-// 但比整个服务器卡死要好，而且日志会明确写出来方便定位）。
+// 【为什么不能"超时就放弃等待（detach）"】
+// 踩过的坑：上一版超时后直接 pthread_detach 就走人，结果那个游离线程继续跑，
+// 进程退出时它还在已卸载的代码里 —— CI 上就是 Segmentation fault (exit 139)。
+// 所以现在的策略是：
+//   1. 先调 ps_request_stop_sampling()，让正在进行的采样在毫秒级内放弃本轮
+//      （否则线程多的机器上一轮要几百毫秒，看起来就像"线程不肯退"）；
+//   2. 再耐心等它退出。Linux 上用 tryjoin 轮询（能检测到"真的退了"），
+//      超时了只告警、**不 detach**，避免制造野线程；
+//   3. 等到了就 join，彻底回收。
 void stop_sampler_thread() {
     g_thread_stop = true;
-    vlog("stop_sampler: waiting for sampler thread");
+    ps::ps_request_stop_sampling();
+    vlog("stop_sampler: stop requested, waiting for sampler thread");
 #if defined(_WIN32)
     if (g_thread_handle) {
-        DWORD w = WaitForSingleObject(g_thread_handle, 5000);
+        DWORD w = WaitForSingleObject(g_thread_handle, 10000);
         vlog("stop_sampler: WaitForSingleObject -> %lu (0=signaled, 258=timeout)", (unsigned long)w);
         if (w == WAIT_TIMEOUT) {
-            console_out("[perfstat] 警告: 采样线程未能在 5 秒内退出，已放弃等待\n");
+            console_out("[perfstat] 警告: 采样线程未能在 10 秒内退出（不会强行分离，"
+                        "避免野线程在卸载后崩服）\n");
         }
         CloseHandle(g_thread_handle);
         g_thread_handle = 0;
     }
 #else
     if (g_thread) {
-        // pthread_join 没有超时版本，用一个短的握手来等：
-        // 采样线程退出时会把自己清掉，g_thread 变成 0。
-        for (int waited_ms = 0; waited_ms < 5000 && g_thread_alive; waited_ms += 10) {
+        // pthread_join 没有超时版本。用 tryjoin 轮询：只有真的等到线程结束才继续，
+        // 这样绝不会在采样线程还活着的时候去 dlclose。
+        bool joined = false;
+        for (int waited_ms = 0; waited_ms < 10000; waited_ms += 10) {
+            int r = pthread_tryjoin_np(g_thread, 0);
+            if (r == 0) {
+                joined = true;
+                vlog("stop_sampler: sampler thread exited after ~%d ms", waited_ms);
+                break;
+            }
+            // 走到这里说明线程还没退（EBUSY），继续等
             ps_sleep_ms(10);
         }
-        if (g_thread_alive) {
-            vlog("stop_sampler: TIMEOUT, sampler thread still alive -> detach");
-            console_out("[perfstat] 警告: 采样线程未能在 5 秒内退出，已放弃等待\n");
-            pthread_detach(g_thread);
-        } else {
-            vlog("stop_sampler: sampler thread exited, joining");
-            pthread_join(g_thread, 0);
+        if (!joined) {
+            vlog("stop_sampler: TIMEOUT after 10s, sampler thread still alive");
+            console_out("[perfstat] 警告: 采样线程未能在 10 秒内退出（不会强行分离，"
+                        "避免野线程在卸载后崩服）\n");
         }
         g_thread = 0;
     }

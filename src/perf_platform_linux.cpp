@@ -68,6 +68,9 @@ thread_local int g_slot_cursor = 0;
 int g_sig = -1;
 bool g_inited = false;
 
+// "尽快停止采样"标志（原子读写，采样线程与插件主线程并发访问）
+static volatile int g_stop_sampling = 0;
+
 //----------------------------------------------------------------------------------------
 // 信号处理器
 //----------------------------------------------------------------------------------------
@@ -555,6 +558,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
     int count = 0;
 
     for (int k = 0; k < n && count < max_ips; ++k) {
+        if (__atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE)) break;
         const int pos = i0 + k;
         if (pos < 0 || pos >= (int)tid_list.size()) break;
         const int tid = tid_list[pos];
@@ -584,9 +588,19 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
                 }
                 break;
             }
+            // 有人请求停止（插件正在卸载）就立刻放弃本轮，别再等满 20ms。
+            // 这是"采样线程能迅速退出"的关键：线程多的时候一轮本来要几百毫秒。
+            if (__atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE)) break;
+
             clock_gettime(CLOCK_MONOTONIC, &now);
             long ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
             if (ms > 20) break;  // 该线程屏蔽了这个信号，放弃
+
+            // 轮询之间小睡一下，避免空转烧 CPU（原来是纯忙等）
+            struct timespec tiny;
+            tiny.tv_sec = 0;
+            tiny.tv_nsec = 200000;  // 0.2ms
+            nanosleep(&tiny, 0);
         }
         __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
     }
@@ -716,6 +730,21 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
     if (offset) *offset = (uint32_t)(rva - m->entries[best].value);
     return m->names[m->entries[best].name_index].c_str();
 }
+
+void ps_prepare_sampling_thread(void) {
+    if (!g_inited) ps_platform_init();
+    if (g_sig < 0) return;
+    // 创建采样线程的那个线程可能屏蔽了采样信号（掩码会被继承），这里把它解开，
+    // 否则采样线程自己也收不到信号，就永远采不到东西。
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, g_sig);
+    pthread_sigmask(SIG_UNBLOCK, &one, 0);
+}
+
+void ps_request_stop_sampling(void) { __atomic_store_n(&g_stop_sampling, 1, __ATOMIC_RELEASE); }
+
+bool ps_stop_requested(void) { return __atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE) != 0; }
 
 //----------------------------------------------------------------------------------------
 // 杂项

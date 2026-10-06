@@ -216,7 +216,9 @@ static const int kSampleWindow = 24;
 
 void Profiler::sampler_loop() {
     int cursor = 0;
-    while (m_running) {
+    // 每轮都检查 ps_stop_requested()：插件卸载时会请求停止，
+    // 这样采样线程能在毫秒级退出，而不是把当前这一轮跑完（可能几百毫秒）。
+    while (m_running && !ps_stop_requested()) {
         double t0 = ps_now_seconds();
 
         int n = ps_sample_threads_window(m_ip_buffer, m_tid_buffer, m_ip_capacity, &cursor,

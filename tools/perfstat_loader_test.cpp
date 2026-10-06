@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/core.h"
 #include "../src/plugin_api.h"
 
 static int g_fail = 0;
@@ -312,6 +313,25 @@ int main(int argc, char **argv) {
         if (cc) cc->Dispatch(c.cmd);
     }
     CHECK(true, "全部 perf_* 指令通过 Dispatch 走通（没有崩溃）");
+
+    // 关键：插件【自己的采样线程】也必须真的采到样本。
+    // 这一条是补上来的 —— 之前只断言"报告有输出"，结果 Linux 上插件 profiler 的
+    // 采样次数其实是 0 却没被发现（采样线程继承了创建者的信号掩码，自己收不到信号）。
+    {
+        typedef void *(*GetProfilerFn)(void);
+        GetProfilerFn getp = (GetProfilerFn)GetProcAddress(dll, "perfstat_get_profiler");
+        CHECK(getp != 0, "插件导出了 perfstat_get_profiler");
+        if (getp) {
+            ps::Profiler *prof = (ps::Profiler *)getp();
+            CHECK(prof != 0, "插件内部 profiler 实例非空");
+            if (prof) {
+                unsigned long long total = (unsigned long long)prof->total_samples();
+                printf("  插件自身采样次数 = %llu（模块 %d / 线程 %d）\n", total, prof->module_count(),
+                       prof->thread_count());
+                CHECK(total > 0, "插件自己的采样线程确实采到了样本");
+            }
+        }
+    }
 
     printf("\n--- 调用 Unload() ---\n");
     plugin->Unload();

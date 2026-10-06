@@ -107,6 +107,7 @@ public:
     }
 
     // ---- 采样线程主循环（由 plugin 创建线程调用，直到 stop 返回）----
+    // 内部会周期性检查 ps_stop_requested()，保证插件卸载时能迅速退出。
     void sampler_loop();
 
     // ---- 采样数据 ----

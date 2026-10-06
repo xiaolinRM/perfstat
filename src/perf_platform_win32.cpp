@@ -49,6 +49,16 @@ HANDLE g_process = 0;
 bool g_wow64 = false;
 bool g_inited = false;
 
+// "尽快停止采样"标志（与 Linux 侧语义一致）
+// 这个文件不包含 compat.h（它是纯 C 风格的平台实现），所以直接用 MSVC 内部函数。
+static volatile long g_stop_sampling = 0;
+static inline long stop_flag_get(void) {
+    return _InterlockedCompareExchange(const_cast<volatile long *>(&g_stop_sampling), 0, 0);
+}
+static inline void stop_flag_set(long v) {
+    _InterlockedExchange(const_cast<volatile long *>(&g_stop_sampling), v);
+}
+
 typedef BOOL(WINAPI *QueryWorkingSetExFn)(HANDLE, PVOID, DWORD);
 
 QueryWorkingSetExFn g_QueryWorkingSetEx = 0;
@@ -529,6 +539,7 @@ static int sample_tids(const DWORD *tids, int count, uintptr_t *ips, uint32_t *o
     const DWORD self = GetCurrentThreadId();
     int n = 0;
     for (int i = 0; i < count && n < max_ips; ++i) {
+        if (stop_flag_get()) break;  // 有人请求停止就尽快收手
         if (tids[i] == self || tids[i] == 0) continue;  // 不挂起采样线程自己
         uintptr_t ip = peek_thread_ip(tids[i]);
         if (!ip) continue;
@@ -727,6 +738,14 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 //----------------------------------------------------------------------------------------
 // 杂项
 //----------------------------------------------------------------------------------------
+// Windows 用 SuspendThread + GetThreadContext 取指令指针，不依赖信号，
+// 所以不需要"解开信号屏蔽"这一步。
+void ps_prepare_sampling_thread(void) {}
+
+void ps_request_stop_sampling(void) { stop_flag_set(1); }
+
+bool ps_stop_requested(void) { return stop_flag_get() != 0; }
+
 double ps_now_seconds() {
     static LARGE_INTEGER freq;
     static bool init = false;
