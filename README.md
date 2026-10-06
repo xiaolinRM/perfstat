@@ -93,6 +93,34 @@ make            # 产物：Release/perfstat_srv.so
 > 校验产物、再跑一遍 POSIX 加载自检（dlopen + 假 ICvar + 真实采样）。
 > 如果 Actions 报错，把失败那一步的日志发我即可。
 
+### 上传到 GitHub 之前要做什么
+
+**直接推整个 `perfstat` 文件夹就行，不需要手动删东西**：`.gitignore` 已经把
+`build/`、`Release/`、`dist/`、`*.log`、`*.obj`、`*.dll`、`*.so` 之类全部忽略掉了。
+
+仓库里应该只有这些（20 个文件）：
+
+```
+.github/workflows/build.yml      GitHub Actions 工作流
+.gitignore
+build_win32.bat                  Windows 构建脚本
+Makefile                         Linux 构建脚本
+perfstat.ini                     配置示例
+README.md
+src/*.h  src/*.cpp               源码（8 个）+ perfstat.def（说明用，当前不需要）
+tools/*.bat  tools/Makefile.linux_tests
+tools/perfstat_tests.cpp         算法/ABI 自检
+tools/perfstat_loader_test.cpp   Windows 加载自检
+tools/perfstat_loader_test_linux.cpp   Linux 加载自检
+tools/perfstat_smoke_linux.cpp   Linux 平台层冒烟测试
+```
+
+> 如果你已经推过一次、发现仓库里有 `build/` 之类的残留，用这两条清掉：
+> ```bash
+> git rm -r --cached build Release dist
+> git commit -m "stop tracking build output"
+> ```
+
 ### 想改用真实 hl2sdk 编译？
 
 加 `/DPERFSTAT_USE_SDK`（或 `-DPERFSTAT_USE_SDK`），并把 `hl2sdk-l4d2/public` 等目录加进
@@ -380,6 +408,14 @@ CPU% = 该模块命中采样数 / 总采样数
 执行 `perf_selftest` 会明确告诉你当前用的是哪一条通道。如果那里显示的是
 `stdout (兜底)`，说明前两条都不可用，把结果发我。
 
+**Q：Linux 上执行 `perf_*` 会不会卡住？**
+v1.0.2 修掉了一个真实的死等 bug。Linux 的采样是"给目标线程发信号，等信号处理器把指令指针
+写回槽位"；槽位下标原本放在**全局变量**里，于是当进程里存在**两个采样者**时（插件自己的
+采样线程 + 离线自检程序直接调 `ps_sample_threads`，或者将来别的插件也做类似的事），
+两边会互相改写这个下标，导致某一边永远等不到回填而死等。
+现在槽位改成 `thread_local`，每个采样线程各用一份，互不干扰。Windows 用
+`SuspendThread` 挂起线程取上下文，不存在这个问题——这也解释了为什么当初只有 Linux 卡。
+
 **Q：`perf_stat` 输出的 CPU% 全是 0？**
 还没采到数据。先 `perf_start 10 60`，或者确认 `perfstat.ini` 里 `auto_start = 1`。
 报告末尾也会提示"还没有采到数据，请先执行 perf_start"。
@@ -445,7 +481,19 @@ build\perfstat_loader_test.exe
 
 当前状态：**36 项 + 13 项全部通过**。
 
-### 10.3 Linux 自检 `perfstat_loader_test_linux`
+### 10.3 Linux 平台层冒烟测试 `perfstat_smoke_linux`
+
+```bash
+make -f tools/Makefile.linux_tests smoke
+./build/perfstat_smoke_linux 60        # 参数是超时秒数
+```
+
+这个程序**不加载插件**，只调平台层的三个入口（`ps_platform_init` /
+`ps_enum_modules` / `ps_sample_threads`），用来把"信号采样本身有没有问题"和
+"插件加载流程有没有问题"分开定位。它带一个 `SIGALRM` 看门狗：超时就把当前卡在哪个阶段
+写到 stderr 再退出，不会让 CI 一直挂着。
+
+### 10.4 Linux 自检 `perfstat_loader_test_linux`
 
 ```bash
 make -f tools/Makefile.linux_tests
@@ -463,7 +511,7 @@ make -f tools/Makefile.linux_tests
    验证信号采样通路和模块归因真的能工作
 6. `Unload()` 反注册全部指令，`dlclose()` 成功（说明采样线程收干净了）
 
-### 10.4 还没验证的部分
+### 10.5 还没验证的部分
 
 - **在真实 srcds 里加载**：本机没有 L4D2 服务端，无法实测。
   能离线验证的部分（导出符号、ABI、加载流程、指令注册与派发、采样算法、
@@ -536,7 +584,8 @@ perfstat/
     ├── perfstat_tests.cpp              算法/ABI 自检（跨平台）
     ├── perfstat_loader_test.cpp        模拟引擎加载的自检（Windows）
     ├── perfstat_loader_test_linux.cpp  模拟引擎加载的自检（Linux / dlopen）
-    ├── Makefile.linux_tests            Linux 自检的构建
+    ├── perfstat_smoke_linux.cpp        Linux 平台层冒烟测试（不加载插件，带看门狗）
+    ├── Makefile.linux_tests            Linux 两个自检的构建
     ├── build_tests.bat
     └── build_loader_test.bat
 ```

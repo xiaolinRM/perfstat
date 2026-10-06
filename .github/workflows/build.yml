@@ -136,15 +136,39 @@ jobs:
           nm -D --defined-only Release/perfstat_srv.so | grep -E "CreateInterface|perfstat_factory"
           echo "产物校验通过：32 位 ELF，导出 CreateInterface / perfstat_factory"
 
-      # ---- 加载自检 ----
-      - name: 编译加载自检
+      # ---- 自检 ----
+      - name: 编译自检程序
         run: make -f tools/Makefile.linux_tests
 
+      # 先跑“平台层冒烟测试”：只验证信号采样 / 模块枚举 / 符号解析，不加载插件。
+      # 万一加载自检卡住，这一步能立刻说明问题出在平台层还是插件加载流程。
+      - name: 运行平台层冒烟测试
+        run: |
+          set -e
+          rc=0
+          timeout 120 ./build/perfstat_smoke_linux 60 > build/smoke_linux.log 2>&1 || rc=$?
+          echo "===== smoke log ====="
+          cat build/smoke_linux.log
+          if [ "$rc" != "0" ]; then
+            echo "::error::平台层冒烟测试失败或超时（exit=$rc）"
+            exit 1
+          fi
+          grep -q "全部阶段完成" build/smoke_linux.log
+
+      # 再跑完整加载自检：dlopen 插件 + 假 ICvar + 指令注册/派发 + 真实采样
+      # 2>&1 是为了同时收 stdout/stderr（看门狗会把卡住的阶段写进 stderr）
       - name: 运行加载自检
         run: |
           set -e
-          ./build/perfstat_loader_test_linux Release/perfstat_srv.so > build/loader_test_linux.log 2>&1
+          rc=0
+          timeout 180 ./build/perfstat_loader_test_linux Release/perfstat_srv.so 120 \
+              > build/loader_test_linux.log 2>&1 || rc=$?
+          echo "===== loader test log ====="
           cat build/loader_test_linux.log
+          if [ "$rc" != "0" ]; then
+            echo "::error::Linux 加载自检失败或超时（exit=$rc）"
+            exit 1
+          fi
           grep -q "失败 0 项" build/loader_test_linux.log
           echo "Linux 加载自检通过"
 
@@ -156,8 +180,8 @@ jobs:
           mkdir -p dist/perfstat-linux/addons dist/perfstat-linux/tests
           cp Release/perfstat_srv.so dist/perfstat-linux/addons/
           cp perfstat.ini README.md  dist/perfstat-linux/
-          cp build/perfstat_loader_test_linux dist/perfstat-linux/tests/
-          cp build/loader_test_linux.log       dist/perfstat-linux/tests/
+          cp build/perfstat_loader_test_linux build/perfstat_smoke_linux dist/perfstat-linux/tests/
+          cp build/loader_test_linux.log build/smoke_linux.log       dist/perfstat-linux/tests/
           cd dist && zip -r perfstat-linux.zip perfstat-linux
           ls -lR dist
 

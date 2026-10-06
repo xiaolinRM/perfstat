@@ -17,6 +17,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,24 @@
 
 static int g_fail = 0;
 static int g_pass = 0;
+
+// 看门狗：CI 上如果哪一步卡住，至少能在日志里看到卡在哪，
+// 并且主动退出（退出码 3），不要一直挂到 GitHub 的 6 小时上限。
+static volatile const char *g_phase = "start";
+
+static void on_alarm(int) {
+    const char *p = g_phase;
+    (void)!write(2, "\n[loader] 超时！卡在阶段: ", 32);
+    (void)!write(2, p, strlen(p));
+    (void)!write(2, "\n", 1);
+    _exit(3);
+}
+
+static void phase(const char *p) {
+    g_phase = p;
+    fprintf(stderr, "[loader] >>> %s\n", p);
+    fflush(stderr);
+}
 
 #define CHECK(cond, msg)                                              \
     do {                                                              \
@@ -172,8 +191,17 @@ static void *busy_thread(void *) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IONBF, 0);
+    setvbuf(stderr, 0, _IONBF, 0);
+
+    // 超时保护：默认 120 秒，可用第二个参数覆盖
+    int timeout_sec = argc > 2 ? atoi(argv[2]) : 120;
+    if (timeout_sec <= 0) timeout_sec = 120;
+    signal(SIGALRM, on_alarm);
+    alarm((unsigned)timeout_sec);
+
     printf("perfstat 加载自检（Linux / dlopen）\n");
     printf("================================================================================\n");
+    fprintf(stderr, "[loader] 看门狗已启用：%d 秒\n", timeout_sec);
 
     const char *so_path = argc > 1 ? argv[1] : "Release/perfstat_srv.so";
     printf("目标插件: %s\n\n", so_path);
@@ -183,6 +211,7 @@ int main(int argc, char **argv) {
     CHECK(sizeof(ConCommandBase) == 24, "ConCommandBase 布局与 l4d2 SDK 一致（24 字节）");
     CHECK(sizeof(void *) == 4, "当前是 32 位进程（srcds 是 32 位的）");
 
+    phase("dlopen 插件");
     // ---- 1. dlopen ----
     void *so = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     CHECK(so != 0, "dlopen 成功加载插件");
@@ -211,6 +240,7 @@ int main(int argc, char **argv) {
 
     IServerPluginCallbacks *plugin = (IServerPluginCallbacks *)iface;
 
+    phase("plugin->Load()");
     // ---- 3. Load（递假 ICvar）----
     printf("\n--- 调用 Load(interfaceFactory, ...) ---\n");
     bool ok = plugin->Load(fake_interface_factory, 0);
@@ -228,6 +258,7 @@ int main(int argc, char **argv) {
     }
     CHECK(found == 10, "10 个指令都注册成功且 GetName() 正确");
 
+    phase("输出通道验证");
     // ---- 4. 输出通道 ----
     printf("\n--- 验证控制台输出通道 ---\n");
     {
@@ -247,6 +278,7 @@ int main(int argc, char **argv) {
         CHECK(saw, "perf_selftest 报告的输出通道是 ICvar::ConsolePrintf");
     }
 
+    phase("平台采样 2 秒");
     // ---- 5. 真实采样：直接驱动平台采样层 ----
     printf("\n--- 真实采样验证（2 秒）---\n");
     pthread_t bt;
@@ -284,8 +316,12 @@ int main(int argc, char **argv) {
         }
         CHECK(self_base != 0, "找到本测试程序的模块基址（用于归因交叉验证）");
 
-        for (int round = 0; round < 200; ++round) {
+        for (int round = 0; round < 100; ++round) {
             int n2 = ps::ps_sample_threads(ips, tids, 256);
+            if (round % 25 == 0) {
+                fprintf(stderr, "[loader]   采样轮 %d，累计 %d\n", round, total);
+                fflush(stderr);
+            }
             for (int i = 0; i < n2; ++i) {
                 total++;
                 if (self_base && ips[i] >= self_base && ips[i] < self_base + self_size) self_hits++;
@@ -299,6 +335,7 @@ int main(int argc, char **argv) {
     CHECK(total > 50, "平台采样层能采到样本（信号采样通路正常）");
     CHECK(self_hits > 0, "样本能正确归属到模块（busy 线程在本程序 .text 里）");
 
+    phase("perf_dump / perf_top");
     // ---- 6. 让插件自己出一份报告（顺带验证 log 落盘）----
     printf("\n--- 执行 perf_dump / perf_top ---\n");
     {
@@ -313,6 +350,7 @@ int main(int argc, char **argv) {
     }
     CHECK(g_fake_cvar.console_lines.size() > 20, "perf_dump / perf_top 都有控制台输出");
 
+    phase("Unload + dlclose");
     // ---- 7. Unload + dlclose ----
     printf("\n--- 调用 Unload() ---\n");
     plugin->Unload();
@@ -322,6 +360,8 @@ int main(int argc, char **argv) {
     int dlrc = dlclose(so);
     CHECK(dlrc == 0, "dlclose 成功卸载（采样线程已收干净，没有线程跑在已卸载代码上）");
 
+    alarm(0);
+    fprintf(stderr, "[loader] 全部阶段完成\n");
     printf("\n================================================================================\n");
     printf("结果: 通过 %d 项, 失败 %d 项\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

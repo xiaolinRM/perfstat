@@ -1,8 +1,10 @@
 #========================================================================================
 # perfstat - Linux 自检工具构建
 #
-#   make -f tools/Makefile.linux_tests
+#   make -f tools/Makefile.linux_tests                  # 两个都编
+#   make -f tools/Makefile.linux_tests smoke            # 只编冒烟测试
 #   ./build/perfstat_loader_test_linux Release/perfstat_srv.so
+#   ./build/perfstat_smoke_linux 60
 #
 # 自检程序需要用到平台层（模块枚举 / 采样）来交叉验证，所以直接编译
 # src/perf_platform_linux.cpp 进测试程序里（不是链接进 .so）。
@@ -14,11 +16,12 @@ CXXFLAGS = -m32 -std=c++11 -O2 -Wall -Wno-unused-parameter -Wno-write-strings \
 LDFLAGS  = -m32
 LIBS     = -lpthread -ldl
 
-SRCDIR   = src
-BINDIR   = build
-TARGET   = $(BINDIR)/perfstat_loader_test_linux
+SRCDIR    = src
+BINDIR    = build
+TARGET    = $(BINDIR)/perfstat_loader_test_linux
+SMOKE     = $(BINDIR)/perfstat_smoke_linux
 
-all: $(TARGET)
+all: $(TARGET) $(SMOKE)
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
@@ -27,7 +30,13 @@ $(TARGET): tools/perfstat_loader_test_linux.cpp $(SRCDIR)/perf_platform_linux.cp
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "构建完成: $(TARGET)"
 
-clean:
-	rm -f $(TARGET)
+$(SMOKE): tools/perfstat_smoke_linux.cpp $(SRCDIR)/perf_platform_linux.cpp | $(BINDIR)
+	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "构建完成: $(SMOKE)"
 
-.PHONY: all clean
+smoke: $(SMOKE)
+
+clean:
+	rm -f $(TARGET) $(SMOKE)
+
+.PHONY: all smoke clean

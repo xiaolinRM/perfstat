@@ -44,20 +44,28 @@ namespace {
 
 //----------------------------------------------------------------------------------------
 // 采样槽位
+//
+// 【为什么必须用 thread_local】
+// 采样是"投递信号 -> 等信号处理器把自己的 IP 写回来"。如果槽位下标放在全局变量里，
+// 那么当进程里存在【两个采样者】时（例如插件自己的采样线程，加上离线自检程序直接调
+// ps_sample_threads），A 投递信号后 B 也会改写这个全局下标，A 等待的槽位就再也填不上，
+// 于是死等。Windows 是 SuspendThread 挂起线程取上下文，不存在这个问题，所以只有
+// Linux 会卡。
+//
+// 用 thread_local 之后，每个采样线程各用自己的一份槽位，互不干扰。
 //----------------------------------------------------------------------------------------
-const int kMaxSlots = 4096;
+const int kMaxSlots = 64;
 
 struct Slot {
     volatile int state;  // 0=空闲 1=已投递 2=已完成
     volatile unsigned long ip;
 };
 
-Slot g_slots[kMaxSlots];
+thread_local Slot g_slots[kMaxSlots];
+// 每个采样线程自己的进度游标，避免多个采样者互相踩
+thread_local int g_slot_cursor = 0;
 
 int g_sig = -1;
-volatile int g_current_slot = -1;
-volatile int g_handler_ready = 0;
-
 bool g_inited = false;
 
 //----------------------------------------------------------------------------------------
@@ -71,13 +79,21 @@ bool g_inited = false;
 #define PS_UC_IP(uc) (0UL)
 #endif
 
+// 信号处理器里怎么知道该写哪个槽位？
+// 不靠全局变量，而是直接扫描本线程的那一份槽位表，找第一个"已投递"的槽位。
+// 本线程同一时刻最多只有一个请求在飞（sample_tid_range 是严格串行的），所以不会认错。
+// 另外：采样线程自己屏蔽了这个信号，所以处理器不可能在"等待中"的线程上重入。
 void ps_signal_handler(int, siginfo_t *, void *vctx) {
     ucontext_t *uc = (ucontext_t *)vctx;
-    int idx = g_current_slot;
-    if (idx >= 0 && idx < kMaxSlots) {
-        g_slots[idx].ip = PS_UC_IP(uc);
-        __atomic_store_n(&g_slots[idx].state, 2, __ATOMIC_RELEASE);
+    unsigned long ip = PS_UC_IP(uc);
+    for (int i = 0; i < kMaxSlots; ++i) {
+        if (__atomic_load_n(&g_slots[i].state, __ATOMIC_ACQUIRE) == 1) {
+            g_slots[i].ip = ip;
+            __atomic_store_n(&g_slots[i].state, 2, __ATOMIC_RELEASE);
+            return;
+        }
     }
+    // 没有在等回填的槽位：说明这个信号不是我们这一轮投递的（理论上不该发生），丢掉即可
 }
 
 //----------------------------------------------------------------------------------------
@@ -376,10 +392,7 @@ bool ps_platform_init() {
     if (g_inited) return true;
     g_inited = true;
 
-    for (int i = 0; i < kMaxSlots; ++i) {
-        g_slots[i].state = 0;
-        g_slots[i].ip = 0;
-    }
+    // thread_local 槽位由运行时零初始化，这里不用管
 
     // 优先用 SIGRTMIN+2；若不可用则退到 SIGURG（SIGPROF 会被游戏/剖析器占用）
     int candidates[3] = {SIGRTMIN + 2, SIGRTMIN + 1, SIGURG};
@@ -505,7 +518,8 @@ void ps_enum_threads(ThreadVisits *out) {
 // 采样
 //----------------------------------------------------------------------------------------
 // 对 tid_list[i0 .. i0+n) 这批线程逐个“投递信号 -> 等待处理器回填”。
-// 必须串行处理：g_current_slot 是全局的，批量投递会让多个处理器写同一个槽位。
+// 必须串行处理：信号处理器是靠“扫描本线程槽位表里第一个已投递的格子”定位的，
+// 批量投递会让多个处理器争抢同一格。
 static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uintptr_t *ips,
                             uint32_t *out_tids, int max_ips) {
     const pid_t self = (pid_t)syscall(SYS_gettid);
@@ -518,13 +532,12 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         const int tid = tid_list[pos];
         if (tid == self) continue;
 
-        // 槽位按下标取模，避免 tid 很大时越界
-        const int idx = pos % kMaxSlots;
+        // 轮转使用本线程的槽位（同一时刻只有一格是"已投递"状态）
+        const int idx = g_slot_cursor;
+        g_slot_cursor = (g_slot_cursor + 1) % kMaxSlots;
 
-        __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].ip, 0, __ATOMIC_RELEASE);
-        g_current_slot = idx;
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
 
         if (syscall(SYS_tgkill, pid, tid, g_sig) != 0) {
             __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
@@ -549,7 +562,6 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         }
         __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
     }
-    g_current_slot = -1;
     return count;
 }
 

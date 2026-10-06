@@ -1,10 +1,19 @@
-# 构建产物
+# =====================================================================================
+#  构建产物（不要提交）
+#  build/ 目录里全是编译中间文件和自检产生的日志，整个目录都忽略掉即可。
+# =====================================================================================
 build/
 Release/
+dist/
+artifacts/
+bundle/
+
+# MSVC / gcc 产物
 *.obj
 *.o
 *.so
 *.dll
+*.dylib
 *.lib
 *.exp
 *.pdb
@@ -12,12 +21,23 @@ Release/
 *.idb
 *.map
 *.asm
+*.exe
+*.res
 
-# 运行时生成的报告
-logs/
+# 运行/自检产生的日志
 *.log
+logs/
 
-# 编辑器
+# 编辑器 / IDE
 .vs/
+.idea/
 *.user
 *.suo
+*.sln.docstates
+CMakeCache.txt
+CMakeFiles/
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
