@@ -191,6 +191,17 @@ int main(int argc, char **argv) {
     if (!iface) return 1;
     IServerPluginCallbacks *plugin = (IServerPluginCallbacks *)iface;
 
+    // 打开插件的调试输出（Load/Unload 每一步都会打到 stderr），
+    // 这样万一某一步卡住，日志里能直接看出卡在哪。
+    {
+        typedef void (*SetVerboseFn)(int);
+        SetVerboseFn setv = (SetVerboseFn)GetProcAddress(dll, "perfstat_set_verbose");
+        if (setv) {
+            setv(1);
+            printf("  [已打开插件 verbose]\n");
+        }
+    }
+
     // ---- Load：把假 ICvar 递进去 ----
     printf("\n--- 调用 Load(interfaceFactory, ...) ---\n");
     bool loaded = plugin->Load(fake_interface_factory, 0);

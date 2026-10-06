@@ -425,11 +425,19 @@ bool ps_platform_init() {
         }
     }
     if (g_sig < 0) return false;
-    // 确保采样线程自己不被这个信号打断（否则会把自己的状态写进槽位）
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, g_sig);
-    pthread_sigmask(SIG_BLOCK, &set, 0);
+
+    // 【这里绝对不要 pthread_sigmask(SIG_BLOCK, ...)】
+    //
+    // 踩过的坑：为了保证"采样线程自己不被这个信号打断"，最初在这里屏蔽了采样信号。
+    // 但 POSIX 规定【新线程会继承创建者的信号掩码】，于是在插件初始化之后创建的线程
+    // （引擎的网络线程、物理线程等等）全都把这个信号屏蔽掉了 —— 采样时 tgkill 投递
+    // 的信号永远进不了那些线程的处理器，结果就是一个样本都采不到（而且不报错）。
+    //
+    // 现在不屏蔽了，安全性靠另外两点保证：
+    //   * 采样时总是跳过"自己"（sample_tid_range 里比对 SYS_gettid），所以采样线程
+    //     不会给自己发信号，也就不会打断自己；
+    //   * 信号处理器本身是异步信号安全的（只扫本线程槽位表 + 写一个指针，不加锁、
+    //     不分配内存），即使被投递到非目标线程也只是白跑一趟。
     return true;
 }
 
@@ -535,6 +543,11 @@ void ps_enum_threads(ThreadVisits *out) {
 // 对 tid_list[i0 .. i0+n) 这批线程逐个“投递信号 -> 等待处理器回填”。
 // 必须串行处理：信号处理器是靠“扫描本线程槽位表里第一个已投递的格子”定位的，
 // 批量投递会让多个处理器争抢同一格。
+// 说明：能不能收到信号取决于【目标线程自己的信号掩码】，而掩码是 per-thread 的，
+// 从采样线程改不了别人的掩码（POSIX 没有这种接口）。所以正确做法是：
+//   * ps_platform_init 里【不要】屏蔽这个信号，让引擎之后创建的线程自然继承"未屏蔽"；
+//   * 如果宿主自己屏蔽了，那这个线程就采不到 —— 属于无法绕过的限制，
+//     采样时会因为 20ms 超时而跳过它，不影响其它线程。
 static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uintptr_t *ips,
                             uint32_t *out_tids, int max_ips) {
     const pid_t self = (pid_t)syscall(SYS_gettid);

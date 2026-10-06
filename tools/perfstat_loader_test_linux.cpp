@@ -271,6 +271,16 @@ int main(int argc, char **argv) {
     IServerPluginCallbacks *plugin = (IServerPluginCallbacks *)iface;
 
     phase("plugin->Load()");
+    // 打开插件的调试输出（每一步耗时都会打到 stderr），方便定位卡在哪一步
+    {
+        typedef void (*SetVerboseFn)(int);
+        SetVerboseFn setv = (SetVerboseFn)dlsym(so, "perfstat_set_verbose");
+        if (setv) {
+            setv(1);
+            fprintf(stderr, "[loader] 已打开插件 verbose\n");
+        }
+    }
+
     // ---- 3. Load（递假 ICvar）----
     printf("\n--- 调用 Load(interfaceFactory, ...) ---\n");
     bool ok = plugin->Load(fake_interface_factory, 0);

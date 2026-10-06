@@ -47,6 +47,36 @@
 static ICvar *g_pCvar = 0;
 
 //----------------------------------------------------------------------------------------
+// 调试开关
+//
+// 打开后 Load/Unload 的每一步都会往 stderr 打时间戳，用来定位"卸载卡住"这类问题。
+// 引擎那边不会打开它（也不该在控制台里输出英文调试信息）；
+// 只有离线加载自检在跑之前会把它打开。
+//----------------------------------------------------------------------------------------
+bool g_perfstat_verbose = false;
+
+// 每行都带一个相对 Load 开始时刻的毫秒时间戳，
+// 这样一眼就能看出"哪一步花了多久"、"卡在哪一步"。
+static double g_vlog_t0 = -1.0;
+
+static void vlog(const char *fmt, ...) {
+    if (!g_perfstat_verbose) return;
+    if (g_vlog_t0 < 0) g_vlog_t0 = ps::ps_now_seconds();
+    double ms = (ps::ps_now_seconds() - g_vlog_t0) * 1000.0;
+
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[perfstat-hb %8.1f ms] ", ms);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    fflush(stderr);
+}
+
+// 导出给离线自检用（名字带前后缀，避免和别的插件撞）
+extern "C" PS_DLL_EXPORT void perfstat_set_verbose(int on) { g_perfstat_verbose = (on != 0); }
+
+//----------------------------------------------------------------------------------------
 // 控制台输出
 //
 // 为什么不用 printf：在本地 listen server 里，游戏进程的 C 运行时 stdout 并不接到
@@ -307,21 +337,44 @@ bool start_sampler_thread() {
 #endif
 }
 
-// 必须在 DLL 卸载前把采样线程收干净，否则线程会跑在已卸载的代码上直接崩服
+// 必须在 DLL 卸载前把采样线程收干净，否则线程会跑在已卸载的代码上直接崩服。
+//
+// 超时保护：正常情况下采样线程最多 50ms 就会看到停止标志退出。
+// 如果 5 秒还没退，说明它卡在采样循环里了 —— 这时候继续无限等下去只会让服务器
+// 挂死在 plugin_unload 上，所以打印警告后放弃等待（线程还在跑是有风险的，
+// 但比整个服务器卡死要好，而且日志会明确写出来方便定位）。
 void stop_sampler_thread() {
     g_thread_stop = true;
+    vlog("stop_sampler: waiting for sampler thread");
 #if defined(_WIN32)
     if (g_thread_handle) {
-        WaitForSingleObject(g_thread_handle, 3000);
+        DWORD w = WaitForSingleObject(g_thread_handle, 5000);
+        vlog("stop_sampler: WaitForSingleObject -> %lu (0=signaled, 258=timeout)", (unsigned long)w);
+        if (w == WAIT_TIMEOUT) {
+            console_out("[perfstat] 警告: 采样线程未能在 5 秒内退出，已放弃等待\n");
+        }
         CloseHandle(g_thread_handle);
         g_thread_handle = 0;
     }
 #else
     if (g_thread) {
-        pthread_join(g_thread, 0);
+        // pthread_join 没有超时版本，用一个短的握手来等：
+        // 采样线程退出时会把自己清掉，g_thread 变成 0。
+        for (int waited_ms = 0; waited_ms < 5000 && g_thread_alive; waited_ms += 10) {
+            ps_sleep_ms(10);
+        }
+        if (g_thread_alive) {
+            vlog("stop_sampler: TIMEOUT, sampler thread still alive -> detach");
+            console_out("[perfstat] 警告: 采样线程未能在 5 秒内退出，已放弃等待\n");
+            pthread_detach(g_thread);
+        } else {
+            vlog("stop_sampler: sampler thread exited, joining");
+            pthread_join(g_thread, 0);
+        }
         g_thread = 0;
     }
 #endif
+    vlog("stop_sampler: done");
 }
 
 //----------------------------------------------------------------------------------------
@@ -466,17 +519,24 @@ ConCommand *perf_register_command(const char *name, const char *help) {
 }
 
 void perf_unregister_commands() {
+    vlog("unregister: begin (%d commands)", g_cmd_count);
     if (g_pCvar) {
-        for (ConCommandBase *p = g_cmd_head; p; p = p->GetNext()) g_pCvar->UnregisterConCommand(p);
+        for (ConCommandBase *p = g_cmd_head; p; p = p->GetNext()) {
+            vlog("unregister: UnregisterConCommand('%s')", p->GetName() ? p->GetName() : "?");
+            g_pCvar->UnregisterConCommand(p);
+        }
     }
+    vlog("unregister: UnregisterConCommand done");
     ConCommandBase *p = g_cmd_head;
     while (p) {
         ConCommandBase *next = p->GetNext();
+        vlog("unregister: delete '%s'", p->GetName() ? p->GetName() : "?");
         delete p;
         p = next;
     }
     g_cmd_head = 0;
     g_cmd_count = 0;
+    vlog("unregister: end");
 }
 
 void ps_register_console_commands() {
@@ -511,7 +571,10 @@ PerfStatPlugin::PerfStatPlugin()
     : m_last_auto_dump(0), m_dumped_once(false) {}
 
 bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn) {
+    g_vlog_t0 = ps::ps_now_seconds();
+    vlog("Load: begin");
     ps_platform_init();
+    vlog("Load: platform init done");
     g_profiler = new Profiler();
     g_profiler->set_sample_interval_ms(g_config.sample_ms);
     g_profiler->set_auto_stop_sec(g_config.auto_stop_sec);
@@ -525,6 +588,7 @@ bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn)
     }
 
     start_sampler_thread();
+    vlog("Load: sampler thread started");
 
     // 取 ICvar 并注册控制台指令（不注册的话引擎会当成 Unknown command 直接丢掉）
     if (interfaceFactory) {
@@ -561,22 +625,30 @@ bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn)
              g_profiler->sample_interval_ms());
     console_out(buf);
     console_out("================================================================================\n");
+    vlog("Load: end");
     return true;
 }
 
 void PerfStatPlugin::Unload(void) {
+    vlog("Unload: begin");
     stop_sampler_thread();
+    vlog("Unload: sampler thread stopped");
     perf_unregister_commands();
+    vlog("Unload: console commands unregistered");
     if (g_pCvar) {
         g_pCvar = 0;
     }
     if (g_profiler) {
         g_profiler->set_running(false);
+        vlog("Unload: profiler stopped");
         delete g_profiler;
         g_profiler = 0;
+        vlog("Unload: profiler deleted");
     }
     ps_platform_shutdown();
+    vlog("Unload: platform shutdown done");
     console_out("[perfstat] 已卸载\n");
+    vlog("Unload: end");
 }
 
 void PerfStatPlugin::Pause(void) {
