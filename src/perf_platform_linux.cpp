@@ -651,6 +651,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
 
         struct timespec start, now;
         clock_gettime(CLOCK_MONOTONIC, &start);
+        int poll_iters = 0;
         for (;;) {
             if (__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE) == 2) {
                 unsigned long ip = __atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE);
@@ -667,8 +668,22 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
 
             clock_gettime(CLOCK_MONOTONIC, &now);
             long ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
-            if (ms > 20) break;  // 该线程屏蔽了这个信号，放弃
+            if (ms > 20) {
+                // 超时了：把这个线程号报出来。CI 上偶尔出现 tgkill 失败/无响应，
+                // 没有这条日志就只能看到"某一轮之后没动静了"。
+                // 不依赖 verbose：超时说明这个线程没响应信号，是异常情况
+                {
+                    static int dbg_to = 0;
+                    if (dbg_to < 12) {
+                        fprintf(stderr, "[perfstat-hb]   TIMEOUT tid=%d after %ld ms (%d polls)\n",
+                                tid, ms, poll_iters);
+                        dbg_to++;
+                    }
+                }
+                break;  // 该线程屏蔽了这个信号，放弃
+            }
 
+            poll_iters++;
             // 轮询之间小睡一下，避免空转烧 CPU（原来是纯忙等）
             struct timespec tiny;
             tiny.tv_sec = 0;
@@ -703,6 +718,18 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     const int total = (int)tid_list.size();
     {
         static int dbg_calls = 0;
+        // 每次窗口调用都记一下耗时：超过 1 秒就报（说明有线程一直不响应）
+        static struct timespec dbg_t0;
+        struct timespec dbg_t1;
+        clock_gettime(CLOCK_MONOTONIC, &dbg_t1);
+        if (dbg_calls > 0 && g_ps_debug) {
+            long dms = (dbg_t1.tv_sec - dbg_t0.tv_sec) * 1000 +
+                       (dbg_t1.tv_nsec - dbg_t0.tv_nsec) / 1000000;
+            if (dms > 1000) {
+                fprintf(stderr, "[perfstat-hb] WINDOW SLOW: previous call took %ld ms\n", dms);
+            }
+        }
+        dbg_t0 = dbg_t1;
         if (g_ps_debug && (dbg_calls < 2 || dbg_calls % 500 == 0)) {
             fprintf(stderr,
                     "[perfstat-hb] ps_sample_window: tids=%d self=%d sig=%d handler_runs=%ld miss=%ld\n",

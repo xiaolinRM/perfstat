@@ -259,8 +259,17 @@ void Profiler::sampler_loop() {
     while (m_running && !ps_stop_requested()) {
         double t0 = ps_now_seconds();
 
+        double t_s0 = ps_now_seconds();
         int n = ps_sample_threads_window(m_ip_buffer, m_tid_buffer, m_ip_capacity, &cursor,
                                          kSampleWindow);
+        double t_s1 = ps_now_seconds();
+        // 单次采样耗时异常必须报出来（这里【不依赖 verbose】）：
+        // 正常应该只有毫秒级，一旦到了百毫秒以上就是严重问题，
+        // 否则只会看到"某一轮之后就没动静了"，很容易误判成采样线程挂了。
+        if ((t_s1 - t_s0) > 0.2) {
+            fprintf(stderr, "[perfstat-hb] SLOW 采样窗口: %.0f ms (n=%d, 线程=%d)\n",
+                    (t_s1 - t_s0) * 1000.0, n, (int)m_threads.size());
+        }
         // 低频心跳：只在 verbose 下每 100 轮打一行。
         // 这条日志能把"采样线程根本没进循环"和"进了循环但一个样本都拿不到"区分开。
         if (verbose_on() && (dbg_round < 2 || dbg_round % 500 == 0)) {
