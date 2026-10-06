@@ -47,7 +47,7 @@ if not exist "build" mkdir "build"
 if not exist "build\tests" mkdir "build\tests"
 
 echo compiling loader test...
-cl /nologo /MT /O2 /W3 /EHsc /utf-8 /GR- /DNDEBUG /DWIN32 /D_WINDOWS ^
+cl /nologo /MT /O2 /W3 /EHsc /utf-8 /GR- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
    /Fo:build\tests\ /Fd:build\tests\perfstat_loader_test.pdb ^
    tools\perfstat_loader_test.cpp ^
    /link /OUT:build\perfstat_loader_test.exe /MACHINE:X86 /SUBSYSTEM:CONSOLE ^

@@ -68,7 +68,7 @@ if not exist "build" mkdir "build"
 
 echo [2/3] compiling...
 if exist "build\perfstat.dll" del /q "build\perfstat.dll"
-cl /nologo /LD /MT /O2 /Ob2 /Oi /GS- /W3 /EHsc /utf-8 /GR- /DNDEBUG /DWIN32 /D_WINDOWS ^
+cl /nologo /LD /MT /O2 /Ob2 /Oi /GS- /W3 /EHsc /utf-8 /GR- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
    /Fo:build\ /Fd:build\perfstat.pdb ^
    src\perfstat.cpp src\core.cpp src\perf_platform_win32.cpp ^
    /link /OUT:build\perfstat.dll /IMPLIB:build\perfstat.lib /MACHINE:X86 ^

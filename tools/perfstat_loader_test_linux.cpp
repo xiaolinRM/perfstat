@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <string>
@@ -342,6 +343,8 @@ int main(int argc, char **argv) {
     static uintptr_t ips[256];
     static uint32_t tids[256];
     int total = 0, self_hits = 0;
+    double worst_ms = 0.0;
+    int slow_rounds = 0;
     uintptr_t self_base = 0;
     size_t self_size = 0;
     {
@@ -371,9 +374,18 @@ int main(int argc, char **argv) {
         CHECK(self_base != 0, "找到本测试程序的模块基址（用于归因交叉验证）");
 
         for (int round = 0; round < 100; ++round) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             int n2 = ps::ps_sample_threads(ips, tids, 256);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double one_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                            (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+            if (one_ms > worst_ms) worst_ms = one_ms;
+            if (one_ms > 15.0) slow_rounds++;
+
             if (round % 25 == 0) {
-                fprintf(stderr, "[loader]   采样轮 %d，累计 %d\n", round, total);
+                fprintf(stderr, "[loader]   采样轮 %d，累计 %d，本轮 %.2f ms\n", round, total,
+                        one_ms);
                 fflush(stderr);
             }
             for (int i = 0; i < n2; ++i) {
@@ -382,12 +394,17 @@ int main(int argc, char **argv) {
             }
             usleep(10000);
         }
+        printf("  单次采样耗时：最慢 %.2f ms，超过 15ms 的有 %d / 100 轮\n", worst_ms, slow_rounds);
     }
     g_busy = false;
     pthread_join(bt, 0);
     printf("  采到 %d 个样本，其中落在本程序模块内 %d 个\n", total, self_hits);
     CHECK(total > 50, "平台采样层能采到样本（信号采样通路正常）");
     CHECK(self_hits > 0, "样本能正确归属到模块（busy 线程在本程序 .text 里）");
+
+    // 单次采样不该慢：如果每次都卡满 20ms 超时，说明信号处理器没有回填槽位
+    // （正是 thread_local 那个 bug 的表现）。
+    CHECK(slow_rounds == 0, "没有一轮采样卡在 15ms 以上（信号处理器正常回填槽位）");
 
     phase("perf_dump / perf_top");
     // ---- 6. 让插件自己出一份报告（顺带验证 log 落盘）----

@@ -49,7 +49,7 @@ if not exist "build" mkdir "build"
 if not exist "build\tests" mkdir "build\tests"
 
 echo compiling self-test...
-cl /nologo /MT /O2 /Ob2 /Oi /GS- /W3 /EHsc /utf-8 /GR- /DNDEBUG /DWIN32 /D_WINDOWS ^
+cl /nologo /MT /O2 /Ob2 /Oi /GS- /W3 /EHsc /utf-8 /GR- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS ^
    /Fo:build\tests\ /Fd:build\tests\perfstat_tests.pdb ^
    tools\perfstat_tests.cpp src\core.cpp src\perf_platform_win32.cpp ^
    /link /OUT:build\perfstat_tests.exe /MACHINE:X86 /SUBSYSTEM:CONSOLE ^

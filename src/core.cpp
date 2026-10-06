@@ -23,13 +23,15 @@ static const size_t kMaxHotPerModule = 4096;
 // （它需要在没有引擎的情况下驱动 profiler）。如果定义放插件里，自检就会链接失败。
 // 平台层用 extern "C" int g_perfstat_verbose_flag; 引用它。
 //----------------------------------------------------------------------------------------
-// 平台层用 extern "C" int g_perfstat_verbose_flag; 引用它，所以这里也必须用 C 链接，
-// 否则符号会被 C++ 修饰成 _g_perfstat_verbose_flag，链接不上。
-extern "C" int g_perfstat_verbose_flag = 0;
+// 先声明成 C 链接（符号名不能被 C++ 修饰），再用普通定义 ——
+// 直接写 `extern "C" int x = 0;` 会被 gcc 警告 "initialized and declared extern"。
+extern "C" int g_perfstat_verbose_flag;
 
 namespace {
 inline bool verbose_on() { return g_perfstat_verbose_flag != 0; }
 }
+
+int g_perfstat_verbose_flag = 0;
 
 Profiler::Profiler()
     : m_ip_buffer(0),

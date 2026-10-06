@@ -45,25 +45,33 @@ namespace {
 //----------------------------------------------------------------------------------------
 // 采样槽位
 //
-// 【为什么必须用 thread_local】
-// 采样是"投递信号 -> 等信号处理器把自己的 IP 写回来"。如果槽位下标放在全局变量里，
-// 那么当进程里存在【两个采样者】时（例如插件自己的采样线程，加上离线自检程序直接调
-// ps_sample_threads），A 投递信号后 B 也会改写这个全局下标，A 等待的槽位就再也填不上，
-// 于是死等。Windows 是 SuspendThread 挂起线程取上下文，不存在这个问题，所以只有
-// Linux 会卡。
+// 采样是"投递信号 -> 等信号处理器把被打断的指令指针写回来"。
+// 这里有两个坑，都踩过：
 //
-// 用 thread_local 之后，每个采样线程各用自己的一份槽位，互不干扰。
+// 坑 1（槽位下标放全局变量）：进程里存在两个采样者时（插件自己的采样线程 + 离线自检
+//   直接调 ps_sample_threads），两边会互相改写同一个下标，某一方永远等不到回填。
+//
+// 坑 2（改成 thread_local，反而彻底坏了）：槽位是【跨线程】的通信单元 ——
+//   采样线程写 state=1，信号处理器在【目标线程】上运行并回填。用 thread_local 之后，
+//   处理器看的是目标线程那份（全空），采样线程轮询的是自己那份（永远等不到），
+//   于是每一次采样都必然 20ms 超时、一个样本都拿不到。
+//
+// 正确做法：槽位表是【全进程共享】的普通全局数组，但给每个采样线程分配一段【私有区间】
+// （按 tid 算窗口起点），这样既跨线程可见，又不会两个采样者互相踩。
 //----------------------------------------------------------------------------------------
-const int kMaxSlots = 64;
+const int kSlotsPerThread = 16;  // 每个采样线程独占的槽位数
+const int kMaxSlots = 4096;      // 槽位表总大小（够 256 个并发采样者）
 
 struct Slot {
     volatile int state;  // 0=空闲 1=已投递 2=已完成
     volatile unsigned long ip;
 };
 
-thread_local Slot g_slots[kMaxSlots];
-// 每个采样线程自己的进度游标，避免多个采样者互相踩
-thread_local int g_slot_cursor = 0;
+// 全进程共享（不能用 thread_local，原因见上）
+static Slot g_slots[kMaxSlots];
+// 每个采样线程自己的窗口起点 + 窗口内游标
+static thread_local int g_slot_window = -1;
+static thread_local int g_slot_cursor = 0;
 
 int g_sig = -1;
 bool g_inited = false;
@@ -85,6 +93,16 @@ static volatile int g_ps_debug = 0;
 #define PS_UC_IP(uc) (0UL)
 #endif
 
+// 给当前采样线程分配一段槽位窗口（第一次调用时算，之后复用）
+static int slot_window_base() {
+    if (g_slot_window < 0) {
+        unsigned long tid = (unsigned long)syscall(SYS_gettid);
+        int window = (int)(tid % (unsigned long)(kMaxSlots / kSlotsPerThread));
+        g_slot_window = window * kSlotsPerThread;
+    }
+    return g_slot_window;
+}
+
 // 信号处理器里怎么知道该写哪个槽位？
 // 不靠全局变量，而是直接扫描本线程的那一份槽位表，找第一个"已投递"的槽位。
 // 本线程同一时刻最多只有一个请求在飞（sample_tid_range 是严格串行的），所以不会认错。
@@ -92,7 +110,12 @@ static volatile int g_ps_debug = 0;
 void ps_signal_handler(int, siginfo_t *, void *vctx) {
     ucontext_t *uc = (ucontext_t *)vctx;
     unsigned long ip = PS_UC_IP(uc);
-    for (int i = 0; i < kMaxSlots; ++i) {
+    // 只扫"采样线程"的窗口（g_slot_window 是 thread_local，
+    // 而处理器运行在采样线程上，所以这里读到的正是发起者的窗口）
+    int base = g_slot_window < 0 ? 0 : g_slot_window;
+    int end = base + kSlotsPerThread;
+    if (end > kMaxSlots) end = kMaxSlots;
+    for (int i = base; i < end; ++i) {
         if (__atomic_load_n(&g_slots[i].state, __ATOMIC_ACQUIRE) == 1) {
             g_slots[i].ip = ip;
             __atomic_store_n(&g_slots[i].state, 2, __ATOMIC_RELEASE);
@@ -413,7 +436,7 @@ bool ps_platform_init() {
     if (g_inited) return true;
     g_inited = true;
 
-    // thread_local 槽位由运行时零初始化，这里不用管
+    // g_slots 是全局数组，静态存储期，本来就零初始化，这里不用管
 
     // 优先用 SIGRTMIN+2；若不可用则退到 SIGURG（SIGPROF 会被游戏/剖析器占用）
     int candidates[3] = {SIGRTMIN + 2, SIGRTMIN + 1, SIGURG};
@@ -567,9 +590,10 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         const int tid = tid_list[pos];
         if (tid == self) continue;
 
-        // 轮转使用本线程的槽位（同一时刻只有一格是"已投递"状态）
-        const int idx = g_slot_cursor;
-        g_slot_cursor = (g_slot_cursor + 1) % kMaxSlots;
+        // 在本线程的私有窗口内轮转（同一时刻只有一格是"已投递"状态）
+        const int base = slot_window_base();
+        const int idx = base + g_slot_cursor;
+        g_slot_cursor = (g_slot_cursor + 1) % kSlotsPerThread;
 
         __atomic_store_n(&g_slots[idx].ip, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
