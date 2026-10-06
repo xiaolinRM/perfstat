@@ -94,7 +94,7 @@ static const char *g_phases[] = {
     "plugin->Load()",
     "输出通道验证",
     "ABI 校验 + 用插件的平台层采样",
-    "观察插件自身采样（2 秒）",
+    "观察插件自身采样",
     "平台采样 2 秒",
     "perf_dump / perf_top",
     "Unload + dlclose",
@@ -512,24 +512,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    phase("观察插件自身采样（2 秒）");
-    // 【重要设计决定】这一段【不再】由自检自己调用 ps::ps_sample_threads。
+    phase("观察插件自身采样");
+    // 这一段验证的是"真实路径"：只起一个忙线程，观察【插件自己的 profiler】样本数是否增长。
     //
-    // 原因：自检和插件各编译了一份 perf_platform_linux.cpp（自检的 Makefile 只编平台层），
-    // 于是进程里有两份 g_slots / 两份信号处理器，而信号处理器是进程级、后装覆盖先装的。
-    // 自检自己发起采样时，实际跑的是插件副本的处理器、填的是插件副本的槽位表，
-    // 自检却在自己的表里等 —— 必然超时。这个冲突只存在于"测试程序"这种场景，
-    // 真实服务器里插件只有一份副本，不存在这个问题。
-    //
-    // 所以这里改为：只起一个忙线程，然后观察【插件自己的 profiler】样本数有没有增长。
-    // 这正好是我们要验证的东西 —— 插件在真实进程里能不能正常采样。
-    // 至于"信号采样通路本身对不对"，由 tools/perfstat_smoke_linux.cpp 负责
-    // （那个程序里只有一份平台副本，是确定性的验证）。
+    // 为什么不再让自检自己编译一份平台层：那样进程里会有两份 g_slots / 两份信号处理器
+    // （处理器是进程级、后装覆盖先装），两边互相踩，表现为超时和零样本 —— 而且只发生在
+    // "自检"这种场景，真实服务器里插件只有一份副本。现在自检一律用插件导出的平台层
+    // （见上面 ABI 校验那一段），所以进程里只有一份，和线上一致。
     {
         // 【先关掉自动停止】perfstat.ini 里 duration_sec 默认是 2 秒，
         // 插件 Load() 时就会按它启动"2 秒后自动停"。而 CI 里从加载到这一段
-        // 往往已经超过 2 秒 —— 插件早就停了，于是后面 sleep(2) 期间一个样本都不涨，
-        // 断言就会失败（踩过）。这里用 perf_start 10 0 明确改成"不自动停"。
+        // 往往已经超过 2 秒 —— 插件早就停了，于是等再久样本也不涨，断言就会失败（踩过）。
+        // 这里用 perf_start 10 0 明确改成"不自动停"。
         {
             ConCommand *cc = (ConCommand *)g_fake_cvar.FindCommandBase("perf_start");
             CHECK(cc != 0, "找得到 perf_start 指令");
@@ -547,11 +541,6 @@ int main(int argc, char **argv) {
         CHECK(getp != 0, "插件导出了 perfstat_get_profiler");
         CHECK(geth != 0, "插件导出了 perfstat_handler_runs");
 
-        unsigned long long before = 0;
-        if (getp) {
-            ps::Profiler *prof = (ps::Profiler *)getp();
-            if (prof) before = (unsigned long long)prof->total_samples();
-        }
         long hb = geth ? geth() : 0;
 
         // 让 CPU 忙着，这样才有东西可采
@@ -563,11 +552,30 @@ int main(int argc, char **argv) {
         // 日志里行号不代表时间顺序（这个坑吃过）。所以关键点都带时间戳。
         typedef double (*NowFn)(void);
         NowFn now_ms = (NowFn)dlsym(so, "perfstat_now_ms");
-        fprintf(stderr, "[loader] [%.0f ms] 准备 sleep(2)\n", now_ms ? now_ms() : -1.0);
+        fprintf(stderr, "[loader] [%.0f ms] 开始等待插件采样增长\n", now_ms ? now_ms() : -1.0);
 
-        sleep(2);
-
-        fprintf(stderr, "[loader] [%.0f ms] sleep(2) 结束\n", now_ms ? now_ms() : -1.0);
+        // 【轮询等待，而不是死等固定 2 秒】
+        // 原来写死 sleep(2) 然后检查一次，在 2 核机器上会偶发失败：
+        // 忙线程 + 主线程把两个核占满时，插件的采样线程可能整个那 2 秒都拿不到 CPU。
+        // 这不是插件的问题，而是"窗口太短 + 机器太忙"。改成"最多等 10 秒，
+        // 一旦样本数增长就立刻通过"，既鲁棒又通常更快。
+        unsigned long long start_samples = 0;
+        if (getp) {
+            ps::Profiler *prof = (ps::Profiler *)getp();
+            if (prof) start_samples = (unsigned long long)prof->total_samples();
+        }
+        int waited_ms = 0;
+        for (; waited_ms < 10000; waited_ms += 100) {
+            unsigned long long cur = 0;
+            if (getp) {
+                ps::Profiler *prof = (ps::Profiler *)getp();
+                if (prof) cur = (unsigned long long)prof->total_samples();
+            }
+            if (cur > start_samples) break;
+            usleep(100 * 1000);
+        }
+        fprintf(stderr, "[loader] [%.0f ms] 等待结束，等了 %d ms\n", now_ms ? now_ms() : -1.0,
+                waited_ms);
 
         g_busy = 0;
         pthread_join(bt, 0);
@@ -594,9 +602,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        printf("  插件自身采样次数: %llu -> %llu（模块 %d / 线程 %d）\n", before, after, mods,
-               threads);
-        g_diag_plugin_before = before;
+        printf("  插件自身采样次数: %llu -> %llu（模块 %d / 线程 %d，等待 %d ms）\n", start_samples,
+               after, mods, threads, waited_ms);
+        g_diag_plugin_before = start_samples;
         g_diag_plugin_after = after;
         if (getp) {
             ps::Profiler *prof = (ps::Profiler *)getp();
@@ -613,7 +621,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("  插件副本的信号处理器运行次数: %ld -> %ld\n", hb, ha);
-        CHECK(after > before, "插件自己的采样线程确实在采到样本（真实进程里可用）");
+        CHECK(after > start_samples, "插件自己的采样线程确实在采到样本（真实进程里可用）");
         CHECK(after > 0, "插件 profiler 样本数大于 0");
     }
 

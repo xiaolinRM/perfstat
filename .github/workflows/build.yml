@@ -192,7 +192,11 @@ jobs:
           cp build/perfstat_loader_test_linux build/perfstat_smoke_linux dist/perfstat-linux/tests/
           cp build/loader_test_linux.log build/smoke_linux.log       dist/perfstat-linux/tests/
           cd dist && zip -r perfstat-linux.zip perfstat-linux
-          ls -lR dist
+          # 注意：上面已经 cd 进 dist 了，这里只能 ls 当前目录。
+          # 原来写的是 `ls -lR dist`，在 dist 里再找 dist 必然失败，
+          # 而 set -e 会让整个打包步骤以退出码 2 结束（zip 其实已经成功了）。
+          ls -lR .
+          echo "zip 大小: $(stat -c %s perfstat-linux.zip) 字节"
 
       - name: 上传 Linux 产物
         uses: actions/upload-artifact@v4
