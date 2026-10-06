@@ -80,6 +80,7 @@ static const char *g_phases[] = {
     "安装闹钟",
     "ps_platform_init",
     "ps_enum_modules",
+    "启动忙线程",
     "ps_enum_threads",
     "ps_sample_threads 单次",
     "连续采样 100 轮",
@@ -156,7 +157,20 @@ int main(int argc, char **argv) {
         fflush(stderr);
     }
 
-    // ---- 3. 线程枚举 ----
+    // ---- 3. 起一个忙线程 ----
+    //
+    // 【为什么必须在这里起】采样是靠"给【别的】线程发信号"取指令指针的，
+    // 采样时总是跳过自己（sample_tid_range 里 `if (tid == self) continue;`）。
+    // 所以如果进程里只有主线程一个线程，采样必然一个目标都没有、永远返回 0。
+    // 这个坑踩过：忙线程原来加在后面的"归因验证"阶段，
+    // 结果前面几个采样阶段全是 0 样本 + 20ms 超时，看起来像信号通路坏了。
+    phase("启动忙线程");
+    pthread_t g_busy_thread;
+    start_busy_thread(&g_busy_thread);
+    fprintf(stderr, "[smoke] OK: 忙线程已启动（采样需要有别的线程可采）\n");
+    fflush(stderr);
+
+    // ---- 3b. 线程枚举（现在应该能看到至少 2 个线程）----
     phase("ps_enum_threads");
     {
         static ps::ThreadInfo ths[256];
@@ -169,6 +183,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < tv.count; ++i) {
             fprintf(stderr, "         tid=%u name=%s\n", ths[i].tid, ths[i].name);
         }
+        CHECK_TRUE(tv.count >= 2, "枚举到不止 1 个线程（采样才有目标）");
         fflush(stderr);
     }
 
@@ -178,10 +193,11 @@ int main(int argc, char **argv) {
         uintptr_t ips[64];
         uint32_t tids[64];
         int n = ps::ps_sample_threads(ips, tids, 64);
-        fprintf(stderr, "[smoke] OK: 单次采样返回 %d 个样本\n", n);
+        fprintf(stderr, "[smoke] 单次采样返回 %d 个样本\n", n);
         for (int i = 0; i < n && i < 5; ++i) {
             fprintf(stderr, "         ip=%p tid=%u\n", (void *)ips[i], tids[i]);
         }
+        CHECK_TRUE(n > 0, "单次采样能取到样本（说明信号投递+回填是通的）");
         fflush(stderr);
     }
 
@@ -202,7 +218,8 @@ int main(int argc, char **argv) {
                 fflush(stderr);
             }
         }
-        fprintf(stderr, "[smoke] OK: 100 轮共 %d 个样本（非空 %d）\n", total, nonnull);
+        fprintf(stderr, "[smoke] 100 轮共 %d 个样本（非空 %d）\n", total, nonnull);
+        CHECK_TRUE(total > 0, "连续采样能采到样本");
         fflush(stderr);
     }
 
@@ -241,10 +258,8 @@ int main(int argc, char **argv) {
     // ---- 7. 单次延迟 + 归因（这一段是平台层的确定性验证）----
     phase("延迟与归因验证");
     {
-        // 起一个忙线程，它的代码在【本程序自己的 .text】里（显式导出、noinline），
+        // 忙线程已经在上面起好了（它的代码在【本程序自己的 .text】里，显式导出 + noinline），
         // 所以采到的样本必须能归属回本程序这个模块。
-        pthread_t bt;
-        start_busy_thread(&bt);
         // 本程序的模块范围
         static ps::ModuleInfo mods[512];
         ps::ModuleVisits mv;
@@ -281,8 +296,6 @@ int main(int argc, char **argv) {
             }
             usleep(5000);
         }
-        stop_busy_thread(bt);
-
         fprintf(stderr,
                 "[smoke] 采样 100 轮：样本 %d，落在本模块 %d；单次最慢 %.2f ms，>15ms 的 %d 轮\n",
                 total, in_self, worst, slow);
@@ -291,8 +304,11 @@ int main(int argc, char **argv) {
         CHECK_TRUE(slow == 0, "没有一轮采样卡在 15ms 以上（信号处理器正常回填槽位）");
     }
 
+    stop_busy_thread(g_busy_thread);
+
     alarm(0);
-    fprintf(stderr, "[smoke] 全部阶段完成，失败 %d 项\n", fails);
+    fprintf(stderr, "[smoke] 全部阶段完成，本地断言失败 %d 项，CHECK_TRUE 失败 %d 项\n", fails,
+            g_fails);
     fflush(stderr);
     return (fails == 0 && g_fails == 0) ? 0 : 1;
 }
