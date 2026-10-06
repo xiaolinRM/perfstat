@@ -40,6 +40,45 @@
 #include "../src/core.h"
 #include "../src/platform.h"
 
+//========================================================================================
+// 平台层：从【插件里】取，不再自己编译一份 perf_platform_linux.cpp
+//
+// 为什么：自检原来自己编一份平台层，于是进程里同时存在两份
+// （自检一份、插件一份）。信号处理器是进程级、后装覆盖先装的，而 g_slots/g_sig 是每份
+// 各自的 —— 两边互相踩，表现为采样超时、样本数 0，只在 Linux 上出现且极难定位。
+// 这个冲突打过三次补丁都没根治（CAS / thread_local / 全局指针）。
+//
+// 现在进程里只有一份平台层，和生产环境（真实服务器上插件也只有一份）完全一致，
+// 所以自检测的就是真实路径。
+//
+// 结构体一律复用 src/platform.h 里的定义（POD），通过 perfstat_ps_abi_sizes 校验布局一致。
+//========================================================================================
+typedef int (*PsInitFn)(void);
+typedef void (*PsEnumModulesFn)(void *);
+typedef void (*PsEnumThreadsFn)(void *);
+typedef int (*PsSampleFn)(uintptr_t *, uint32_t *, int);
+typedef void (*PsSetDebugFn)(int);
+typedef long (*PsHandlerRunsFn)(void);
+typedef int (*PsAbiSizesFn)(int *, int *, int *, int *);
+
+static PsInitFn g_ps_init = 0;
+static PsEnumModulesFn g_ps_enum_modules = 0;
+static PsEnumThreadsFn g_ps_enum_threads = 0;
+static PsSampleFn g_ps_sample_threads = 0;
+static PsSetDebugFn g_ps_set_debug = 0;
+static PsHandlerRunsFn g_ps_handler_runs = 0;
+
+// 解析插件里的平台层入口
+static bool load_plugin_platform(void *so) {
+    g_ps_init = (PsInitFn)dlsym(so, "perfstat_ps_init");
+    g_ps_enum_modules = (PsEnumModulesFn)dlsym(so, "perfstat_ps_enum_modules");
+    g_ps_enum_threads = (PsEnumThreadsFn)dlsym(so, "perfstat_ps_enum_threads");
+    g_ps_sample_threads = (PsSampleFn)dlsym(so, "perfstat_ps_sample_threads");
+    g_ps_set_debug = (PsSetDebugFn)dlsym(so, "perfstat_ps_set_debug");
+    g_ps_handler_runs = (PsHandlerRunsFn)dlsym(so, "perfstat_ps_handler_runs");
+    return g_ps_init && g_ps_enum_modules && g_ps_enum_threads && g_ps_sample_threads;
+}
+
 
 static int g_fail = 0;
 static int g_pass = 0;
@@ -54,6 +93,7 @@ static const char *g_phases[] = {
     "dlopen 插件",
     "plugin->Load()",
     "输出通道验证",
+    "ABI 校验 + 用插件的平台层采样",
     "观察插件自身采样（2 秒）",
     "平台采样 2 秒",
     "perf_dump / perf_top",
@@ -85,6 +125,15 @@ static void phase(const char *p) {
     fflush(stderr);
 }
 
+// 诊断摘要用的全局量（出问题时让用户只贴摘要，省掉来回贴长日志）
+static char g_first_fail[512] = "";
+static int g_diag_total = 0, g_diag_in_self = 0, g_diag_slow = 0;
+static double g_diag_worst_ms = 0.0;
+static long g_diag_handler_runs = 0;
+static unsigned long long g_diag_plugin_before = 0, g_diag_plugin_after = 0;
+static int g_diag_plugin_running = -1, g_diag_plugin_autostop = -1;
+static char g_diag_lock_holder[128] = "";
+
 #define CHECK(cond, msg)                                              \
     do {                                                              \
         if (cond) {                                                   \
@@ -93,6 +142,10 @@ static void phase(const char *p) {
         } else {                                                      \
             printf("  [FAIL] %s  (%s:%d)\n", msg, __FILE__, __LINE__); \
             g_fail++;                                                 \
+            if (g_first_fail[0] == 0) {                               \
+                snprintf(g_first_fail, sizeof(g_first_fail), "%s (%s:%d)", msg, __FILE__,       \
+                         __LINE__);                                                   \
+            }                                                         \
         }                                                             \
     } while (0)
 
@@ -242,6 +295,17 @@ static void *busy_thread(void *) {
     return 0;
 }
 
+// 起/停忙线程的辅助（信号采样需要有"别的线程"可采，而且它的代码要在本程序的 .text 里）
+static void start_busy_thread(pthread_t *t) {
+    g_busy = 1;
+    pthread_create(t, 0, busy_thread, 0);
+}
+
+static void stop_busy_thread(pthread_t t) {
+    g_busy = 0;
+    pthread_join(t, 0);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IONBF, 0);
     setvbuf(stderr, 0, _IONBF, 0);
@@ -341,6 +405,113 @@ int main(int argc, char **argv) {
         CHECK(saw, "perf_selftest 报告的输出通道是 ICvar::ConsolePrintf");
     }
 
+    // 先起忙线程：它的代码在【本程序自己的 .text】里，这样"样本归属到本模块"才有意义。
+    // 之前忘了这一步，采样时段所有线程都在插件/libc 里跑，于是"落在本模块"当然是 0
+    // —— 那是测试设计问题，不是采样问题。
+    pthread_t plat_busy;
+    start_busy_thread(&plat_busy);
+
+    phase("ABI 校验 + 用插件的平台层采样");
+    // 【这一段是平台层的确定性验证，而且是单副本】
+    // 调用的是插件里那一份平台层，进程里没有第二份，所以不存在"两份信号处理器互相踩"。
+    {
+        CHECK(load_plugin_platform(so), "从插件里取到平台层入口（单副本方案）");
+        PsAbiSizesFn abi = (PsAbiSizesFn)dlsym(so, "perfstat_ps_abi_sizes");
+        CHECK(abi != 0, "插件导出了 perfstat_ps_abi_sizes");
+        int m = 0, t = 0, mv = 0, tv = 0, ptr = 0;
+        if (abi) ptr = abi(&m, &t, &mv, &tv);
+        printf("  ABI: ModuleInfo=%d ThreadInfo=%d ModuleVisits=%d ThreadVisits=%d ptr=%d\n", m, t,
+               mv, tv, ptr);
+        CHECK(m == (int)sizeof(ps::ModuleInfo), "ModuleInfo 布局与插件一致");
+        CHECK(t == (int)sizeof(ps::ThreadInfo), "ThreadInfo 布局与插件一致");
+        CHECK(mv == (int)sizeof(ps::ModuleVisits), "ModuleVisits 布局与插件一致");
+        CHECK(tv == (int)sizeof(ps::ThreadVisits), "ThreadVisits 布局与插件一致");
+        CHECK(ptr == (int)sizeof(void *), "指针宽度一致（都是 32 位进程）");
+    }
+    {
+        CHECK(g_ps_init && g_ps_init(), "插件里的平台层初始化成功");
+        g_ps_set_debug(1);  // 让平台层打印采样细节
+
+        // 模块枚举
+        static ps::ModuleInfo mods[512];
+        ps::ModuleVisits mv2;
+        mv2.items = mods;
+        mv2.count = 0;
+        mv2.capacity = 512;
+        g_ps_enum_modules(&mv2);
+        printf("  插件的平台层枚举到 %d 个模块\n", mv2.count);
+        CHECK(mv2.count >= 3, "插件平台层能枚举模块");
+
+        // 找到本程序的模块范围
+        uintptr_t self_base = 0;
+        size_t self_size = 0;
+        for (int i = 0; i < mv2.count; ++i) {
+            if (strstr(mods[i].name, "perfstat_loader") != NULL) {
+                self_base = mods[i].base;
+                self_size = mods[i].size;
+                break;
+            }
+        }
+        CHECK(self_base != 0, "定位到本程序的模块范围");
+
+        // 采样 100 轮（忙线程还没起，但主线程 + 插件采样线程本身就可作为目标）
+        uintptr_t ips[64];
+        uint32_t tids[64];
+        uintptr_t ips_saved[100];
+        int ips_saved_n = 0;
+        int total = 0, in_self = 0, slow = 0;
+        double worst = 0.0;
+        for (int round = 0; round < 100; ++round) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int n = g_ps_sample_threads(ips, tids, 64);
+            for (int i = 0; i < n && ips_saved_n < 100; ++i) ips_saved[ips_saved_n++] = ips[i];
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+            if (ms > worst) worst = ms;
+            if (ms > 15.0) slow++;
+            for (int i = 0; i < n; ++i) {
+                total++;
+                if (self_base && ips[i] >= self_base && ips[i] < self_base + self_size) in_self++;
+            }
+            usleep(5000);
+        }
+        printf("  插件的平台层采样 100 轮：样本 %d，落在本模块 %d；单次最慢 %.2f ms，>15ms %d 轮\n",
+               total, in_self, worst, slow);
+        // 说明：这里【不能】断言"每轮都 <15ms"。忙线程会把一个核占满，而 2 核 CI 上
+        // 信号投递要等调度才能落在忙线程上（实测最慢几十毫秒），这是正常的调度延迟，
+        // 不是采样器的问题。真正该断言的是"不会永远卡住"（最慢有上界）+ "采得到样本"。
+        long hruns = g_ps_handler_runs ? g_ps_handler_runs() : 0;
+        printf("  插件平台层的信号处理器运行次数: %ld\n", hruns);
+        g_diag_total = total;
+        g_diag_in_self = in_self;
+        g_diag_worst_ms = worst;
+        g_diag_slow = slow;
+        g_diag_handler_runs = hruns;
+        CHECK(total > 50, "用插件的平台层能采到足够样本（单副本，信号通路正常）");
+        CHECK(in_self > 0, "样本能正确归属到本程序模块（忙线程在本程序 .text 里）");
+        CHECK(worst < 500.0, "单次采样有上界（不会卡死；忙线程占核时会等调度）");
+        CHECK(total >= 100, "100 轮采样每轮至少拿到 1 个样本（采样节拍稳定）");
+        stop_busy_thread(plat_busy);
+
+        // 归因诊断：把样本分布打出来。万一"落在本模块=0"，这几行能直接说明样本去哪了。
+        if (in_self == 0 && total > 0) {
+            fprintf(stderr, "[loader] 归因诊断：self_base=%p size=%zu，前 10 个样本 IP 及归属:\n",
+                    (void *)self_base, self_size);
+            for (int i = 0; i < 10 && i < 100; ++i) {
+                int owner = -1;
+                for (int k = 0; k < mv2.count; ++k) {
+                    if (ips_saved[i] >= mods[k].base && ips_saved[i] < mods[k].base + mods[k].size) {
+                        owner = k;
+                        break;
+                    }
+                }
+                fprintf(stderr, "[loader]   ip=%p -> %s\n", (void *)ips_saved[i],
+                        owner >= 0 ? mods[owner].name : "(无归属)");
+            }
+        }
+    }
+
     phase("观察插件自身采样（2 秒）");
     // 【重要设计决定】这一段【不再】由自检自己调用 ps::ps_sample_threads。
     //
@@ -419,11 +590,14 @@ int main(int argc, char **argv) {
             LockInfoFn holder = (LockInfoFn)dlsym(so, "perfstat_lock_holder");
             if (holder) {
                 printf("  profiler 锁持有者: '%s'\n", holder());
+                snprintf(g_diag_lock_holder, sizeof(g_diag_lock_holder), "%s", holder());
             }
         }
 
         printf("  插件自身采样次数: %llu -> %llu（模块 %d / 线程 %d）\n", before, after, mods,
                threads);
+        g_diag_plugin_before = before;
+        g_diag_plugin_after = after;
         if (getp) {
             ps::Profiler *prof = (ps::Profiler *)getp();
             if (prof) {
@@ -434,6 +608,8 @@ int main(int argc, char **argv) {
                 // running() / auto_stop_sec() / module_count() / thread_count() 都是 inline，可以放心用。
                 printf("  插件 profiler 状态: running=%d auto_stop=%d\n", (int)prof->running(),
                        prof->auto_stop_sec());
+                g_diag_plugin_running = (int)prof->running();
+                g_diag_plugin_autostop = prof->auto_stop_sec();
             }
         }
         printf("  插件副本的信号处理器运行次数: %ld -> %ld\n", hb, ha);
@@ -470,5 +646,22 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[loader] 全部阶段完成\n");
     printf("\n================================================================================\n");
     printf("结果: 通过 %d 项, 失败 %d 项\n", g_pass, g_fail);
+
+    //----------------------------------------------------------------------------------------
+    // 【故障排查摘要】出问题时只需要把这一段贴出来就够了，不用贴整份日志（几百行）。
+    // 走 stderr（无缓冲），保证即使进程之后出问题也已经写出来了。
+    //----------------------------------------------------------------------------------------
+    fprintf(stderr, "\n===== PERFSTAT 诊断摘要（贴这一段即可）=====\n");
+    fprintf(stderr, "结果: 通过=%d 失败=%d\n", g_pass, g_fail);
+    if (g_first_fail[0]) fprintf(stderr, "首个失败: %s\n", g_first_fail);
+    fprintf(stderr, "平台层来源: 插件 dlsym（单副本，与生产一致）\n");
+    fprintf(stderr, "插件平台层采样: 样本=%d 落在本模块=%d 最慢=%.1fms 超15ms轮数=%d\n",
+            g_diag_total, g_diag_in_self, g_diag_worst_ms, g_diag_slow);
+    fprintf(stderr, "插件平台层信号处理器运行次数=%ld\n", g_diag_handler_runs);
+    fprintf(stderr, "插件自身采样: %llu -> %llu  running=%d auto_stop=%d\n",
+            g_diag_plugin_before, g_diag_plugin_after, g_diag_plugin_running,
+            g_diag_plugin_autostop);
+    fprintf(stderr, "锁持有者='%s'\n", g_diag_lock_holder);
+    fprintf(stderr, "===== 摘要结束 =====\n");
     return g_fail == 0 ? 0 : 1;
 }

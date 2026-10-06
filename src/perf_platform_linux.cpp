@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +120,62 @@ static volatile int g_ps_debug = 0;
 // 诊断计数器：用来区分"信号没送到"和"处理器跑了但没找到槽位"
 static volatile long g_handler_runs = 0;   // 处理器一共进了多少次
 static volatile long g_handler_miss = 0;   // 进了处理器但窗口内没有 state==1 的槽位
+
+//----------------------------------------------------------------------------------------
+// 进程级采样互斥
+//
+// 【为什么必须有】采样要"投递信号 -> 等回填"，而 g_pending_slot 是全局单份的。
+// 如果同一个进程里有【两个采样者】同时跑（例如插件自己的采样线程 + 宿主程序/自检
+// 直接调 ps_sample_threads），两个采样者会互相覆盖对方的 pending 指针：
+// A 设好 pending 正准备等回填，B 紧接着把它改成自己的槽位，于是 A 永远等不到 ——
+// 表现为"偶尔有线程超时 20ms、采样数忽高忽低"，而且只在两个采样者并存时出现。
+//
+// 用它把采样串行化：同一时刻只有一个采样者在跑，另一个短暂自旋等待。
+// 采样本身是毫秒级的，而且冲突很少，所以自旋是合适的。
+//
+// 注意：用 __sync_lock_test_and_set（PS_ATOMIC_SET）实现，和 SpinLock 一致；
+// 这里不能用 g_pending_slot 那套，因为这是"谁有资格采样"的门。
+//----------------------------------------------------------------------------------------
+static volatile long g_sampling_lock = 0;
+
+struct SamplingGuard {
+    bool held;
+
+    // 【不要用纯自旋】另一个采样者采样一轮可能要几十毫秒（忙线程占核时要等调度），
+    // 纯自旋会把 CPU 全烧掉、还可能因为自旋预算耗尽而提前放弃，导致自己一轮都采不到。
+    // 实测踩过：自检那段采样占锁约 5 秒，插件的采样线程自旋耗尽后放弃，
+    // 结果是"插件自身采样 2 秒内 0 增长"这种间歇性失败。
+    //
+    // 所以改成"先自旋一小会儿，然后 sched_yield 让出 CPU"。
+    // 等待上限给得很宽松（默认 30 秒），因为采样本身是毫秒级的，
+    // 真等这么久只可能是另一个采样者被卡住，那时放弃也合理。
+    explicit SamplingGuard(double max_wait_sec = 30.0) : held(false) {
+        if (__sync_lock_test_and_set(&g_sampling_lock, 1) == 0) {
+            held = true;
+            return;
+        }
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        int spins = 0;
+        for (;;) {
+            if (__sync_add_and_fetch(&g_sampling_lock, 0) == 0) {
+                if (__sync_lock_test_and_set(&g_sampling_lock, 1) == 0) {
+                    held = true;
+                }
+                return;
+            }
+            // 先短自旋（冲突很快会过去），再让出 CPU
+            if (++spins < 2000) continue;
+            sched_yield();
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double waited = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+            if (waited > max_wait_sec) return;  // 放弃：返回 0 个样本，不阻塞调用方
+        }
+    }
+    ~SamplingGuard() {
+        if (held) __sync_lock_release(&g_sampling_lock);
+    }
+};
 
 //----------------------------------------------------------------------------------------
 // 信号处理器
@@ -715,6 +772,10 @@ int ps_sample_threads(uintptr_t *ips, uint32_t *out_tids, int max_ips) {
     if (!g_inited) ps_platform_init();
     if (g_sig < 0 || !ips || max_ips <= 0) return 0;
 
+    // 串行化：同一时刻只允许一个采样者（避免多个采样者互相覆盖 pending 槽位）
+    SamplingGuard guard;
+    if (!guard.held) return 0;
+
     static std::vector<int> tid_list;
     tid_list = list_tids();
 
@@ -727,6 +788,10 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
                              int window) {
     if (!g_inited) ps_platform_init();
     if (g_sig < 0 || !ips || max_ips <= 0) return 0;
+
+    // 串行化（同上）
+    SamplingGuard guard;
+    if (!guard.held) return 0;
 
     static std::vector<int> tid_list;
     tid_list = list_tids();

@@ -108,6 +108,74 @@ extern "C" PS_DLL_EXPORT const char *perfstat_lock_holder(void) {
 // （stdout 块缓冲 + stderr 无缓冲，行号不代表时间顺序）。
 extern "C" PS_DLL_EXPORT double perfstat_now_ms(void) { return ps_dbg_now_ms(); }
 
+//========================================================================================
+// 平台层导出（给离线自检程序用）
+//
+// 【为什么必须导出】离线自检原来自己编译一份 perf_platform_linux.cpp，于是进程里同时
+// 存在【两份平台层副本】（自检一份、插件一份）。而信号处理器是进程级、后装覆盖先装的，
+// g_slots / g_sig 却是每份各自的 —— 两边互相踩，表现是采样超时、样本数为 0，
+// 而且只在 Linux 上出现、极难定位。这个冲突打了三次补丁都没根治。
+//
+// 现在改成：自检【不再自己编译平台层】，一律通过 dlsym 调用插件里的这一份。
+// 于是进程里只有一份平台层 —— 和生产环境（真实服务器上插件也只有一份）完全一致，
+// 自检测的就是真实路径。这个函数组就是把平台层暴露出去的唯一入口。
+//
+// 传的都是 platform.h 里的 POD 结构（uintptr_t/size_t/char[]/bool），跨 .so 安全。
+//========================================================================================
+extern "C" PS_DLL_EXPORT int perfstat_ps_init(void) { return ps::ps_platform_init() ? 1 : 0; }
+extern "C" PS_DLL_EXPORT void perfstat_ps_shutdown(void) { ps::ps_platform_shutdown(); }
+extern "C" PS_DLL_EXPORT void perfstat_ps_enum_modules(void *out) {
+    ps::ps_enum_modules((ps::ModuleVisits *)out);
+}
+extern "C" PS_DLL_EXPORT void perfstat_ps_enum_threads(void *out) {
+    ps::ps_enum_threads((ps::ThreadVisits *)out);
+}
+extern "C" PS_DLL_EXPORT int perfstat_ps_sample_threads(uintptr_t *ips, uint32_t *tids,
+                                                        int max_ips) {
+    return ps::ps_sample_threads(ips, tids, max_ips);
+}
+extern "C" PS_DLL_EXPORT int perfstat_ps_sample_window(uintptr_t *ips, uint32_t *tids, int max_ips,
+                                                       int *cursor, int window) {
+    return ps::ps_sample_threads_window(ips, tids, max_ips, cursor, window);
+}
+extern "C" PS_DLL_EXPORT void perfstat_ps_request_stop(void) { ps::ps_request_stop_sampling(); }
+extern "C" PS_DLL_EXPORT int perfstat_ps_stop_requested(void) {
+    return ps::ps_stop_requested() ? 1 : 0;
+}
+extern "C" PS_DLL_EXPORT void perfstat_ps_prepare_thread(void) {
+    ps::ps_prepare_sampling_thread();
+}
+extern "C" PS_DLL_EXPORT void perfstat_ps_set_debug(int on) { ps::ps_set_debug(on); }
+extern "C" PS_DLL_EXPORT long perfstat_ps_handler_runs(void) {
+    return ps::ps_handler_run_count();
+}
+extern "C" PS_DLL_EXPORT double perfstat_ps_now_seconds(void) { return ps::ps_now_seconds(); }
+extern "C" PS_DLL_EXPORT const char *perfstat_ps_platform_name(void) {
+    return ps::ps_platform_name();
+}
+extern "C" PS_DLL_EXPORT uintptr_t perfstat_ps_symbols_open(const char *path, uintptr_t base) {
+    return ps::ps_symbols_open(path, base);
+}
+extern "C" PS_DLL_EXPORT void perfstat_ps_symbols_close(uintptr_t h) { ps::ps_symbols_close(h); }
+extern "C" PS_DLL_EXPORT int perfstat_ps_symbols_get(uintptr_t h, int index, uint32_t *rva,
+                                                     const char **name) {
+    return ps::ps_symbols_get(h, index, rva, name) ? 1 : 0;
+}
+extern "C" PS_DLL_EXPORT const char *perfstat_ps_symbolize(uintptr_t h, uint32_t rva,
+                                                           uint32_t *offset) {
+    return ps::ps_symbolize(h, rva, offset);
+}
+
+// ABI 校验：自检用它确认自己那边的 platform.h 布局和插件这边一致。
+// 布局不一致的话传指针会直接越界，必须先拦住。
+extern "C" PS_DLL_EXPORT int perfstat_ps_abi_sizes(int *mod, int *thr, int *mv, int *tv) {
+    if (mod) *mod = (int)sizeof(ps::ModuleInfo);
+    if (thr) *thr = (int)sizeof(ps::ThreadInfo);
+    if (mv) *mv = (int)sizeof(ps::ModuleVisits);
+    if (tv) *tv = (int)sizeof(ps::ThreadVisits);
+    return (int)sizeof(void *);
+}
+
 //----------------------------------------------------------------------------------------
 // 控制台输出
 //

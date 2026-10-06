@@ -204,7 +204,7 @@ void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
         static unsigned long long dbg_apply_ip0 = 0;
         dbg_apply_calls++;
         if (!ip) dbg_apply_ip0++;
-        if (dbg_apply_calls == 1 || dbg_apply_calls % 100000 == 0) {
+        if (dbg_apply_calls % 500000 == 0) {
             fprintf(stderr, "[perfstat-hb] apply_sample: calls=%llu ip_zero=%llu\n", dbg_apply_calls,
                     dbg_apply_ip0);
         }
@@ -286,7 +286,7 @@ void Profiler::sampler_loop() {
         // 单次采样耗时异常必须报出来（这里【不依赖 verbose】）：
         // 正常应该只有毫秒级，一旦到了百毫秒以上就是严重问题，
         // 否则只会看到"某一轮之后就没动静了"，很容易误判成采样线程挂了。
-        if ((t_s1 - t_s0) > 0.2) {
+        if ((t_s1 - t_s0) > 0.5) {
             fprintf(stderr, "[perfstat-hb] [%.0f ms] SLOW 采样窗口: %.0f ms (n=%d, 线程=%d)\n",
                     ps_dbg_now_ms(), (t_s1 - t_s0) * 1000.0, n, (int)m_threads.size());
         }

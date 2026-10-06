@@ -40,35 +40,30 @@ TARGET    = $(BINDIR)/perfstat_loader_test_linux
 SMOKE     = $(BINDIR)/perfstat_smoke_linux
 
 #----------------------------------------------------------------------------------------
-# 防护网：平台层不能引用 core.cpp / 插件入口的符号
+# 平台层的分层约束（务必遵守，踩过三次）
 #
-# 原因：本 Makefile 只编 src/perf_platform_linux.cpp，不编 core.cpp。
-# 一旦平台层引用了 core.cpp 或 perfstat.cpp 里的东西，链接期才会报 undefined reference，
-# 而这个错误在 Windows 侧永远测不出来（那边编了 core.cpp）。
-# 这条约束已经踩过三次：g_perfstat_verbose_flag / elapsed_seconds / ps_dbg_now_ms。
+# 本 Makefile【只编 src/perf_platform_linux.cpp，不编 core.cpp】。
+#   所以平台层里绝对不能出现下面这些【定义在 core.cpp / perfstat.cpp 的符号】，
+#   否则链接期才会报 undefined reference —— 而这个错误在 Windows 侧永远测不出来。
 #
-# 所以这里在构建前直接扫一遍源码，命中就立刻失败并给出清晰提示。
+#   x  g_perfstat_verbose_flag   诊断开关 -> 平台层用自持的 g_ps_debug + ps_set_debug()
+#   x  elapsed_seconds()         定义在 core.cpp 的 Profiler 成员
+#   x  ps_dbg_now_ms()           时间戳   -> 平台层自带 static ps_plat_now_ms()
+#   x  g_profiler / ps_dbg_lock* 插件状态与锁诊断
+#
+#   平台层可以依赖的只有：platform.h、C/C++ 运行库、pthread。
+#
+# 这里【故意不做】shell 层面的自动检查：那种 grep 规则容易误伤注释、又没法在
+# Windows 上验证，结果反而把构建搞挂（踩过）。约束靠上面这份清单 + 代码评审。
 #----------------------------------------------------------------------------------------
-PLAT_FORBIDDEN := ps_dbg_now_ms|g_perfstat_verbose_flag|elapsed_seconds|g_profiler|ps_dbg_lock
 
-.PHONY: check-platform-layering
-check-platform-layering:
-	@if grep -nE '$(PLAT_FORBIDDEN)' $(PLAT) | grep -v '^\s*//' | grep -vE '踩过|为什么不用|这条约束'; then \
-		echo ""; \
-		echo "!! 平台层引用了 core.cpp / 插件入口的符号（见上面几行）"; \
-		echo "!! 本 Makefile 只编平台层，不编 core.cpp —— 这会导致 undefined reference。"; \
-		echo "!! 平台层只能依赖 platform.h 和 C 运行库；诊断开关用 ps_set_debug()，"; \
-		echo "!! 时间戳之类的工具请在平台层内部自带一份 static 实现。"; \
-		exit 1; \
-	fi
-	@echo "OK: 平台层分层检查通过（没有引用 core.cpp / 插件入口的符号）"
 
-all: check-platform-layering $(TARGET) $(SMOKE)
+all: $(TARGET) $(SMOKE)
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
-$(TARGET): tools/perfstat_loader_test_linux.cpp $(SRCDIR)/perf_platform_linux.cpp | $(BINDIR)
+$(TARGET): tools/perfstat_loader_test_linux.cpp | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "构建完成: $(TARGET)"
 
@@ -76,7 +71,7 @@ $(SMOKE): tools/perfstat_smoke_linux.cpp $(SRCDIR)/perf_platform_linux.cpp | $(B
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "构建完成: $(SMOKE)"
 
-smoke: check-platform-layering $(SMOKE)
+smoke: $(SMOKE)
 
 clean:
 	rm -f $(TARGET) $(SMOKE)

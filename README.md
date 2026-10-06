@@ -724,6 +724,43 @@ profiler 样本数有没有增长**。真实服务器里插件只有一份副本
 
 ---
 
+### 10.8 本地 Linux 验证环境（重要：不要只靠 CI 猜）
+
+**教训**：修 Linux 采样问题时，曾经连续多轮"改代码 → 推 CI → 等人把日志转过来"，
+效率极低，而且很容易误判 —— 日志里 stdout 是块缓冲（进程退出才刷）、stderr 无缓冲，
+两者交错后**行号完全不代表时间顺序**，就因为这个读错了好几次、白改好几轮。
+
+**正确做法**：本地准备一个能跑 32 位 Linux 的环境，改完先自己跑通再推。
+下面这套（VMware + Ubuntu 22.04）已验证可用：
+
+```bash
+# 1. 装 32 位编译支持（srcds 是 32 位的，必须 -m32）
+sudo apt-get install -y g++ g++-multilib make
+
+# 2. 编译
+make                                  # 插件 -> Release/perfstat_srv.so
+make -f tools/Makefile.linux_tests    # 两个自检 -> build/
+
+# 3. 跑（两个都必须 exit 0）
+./build/perfstat_smoke_linux 60
+./build/perfstat_loader_test_linux Release/perfstat_srv.so 120
+```
+
+验收标准（自检结尾会打印一段"诊断摘要"，看那段就够，不用翻整份日志）：
+
+```
+结果: 通过=36 失败=0
+插件平台层采样: 样本=200 落在本模块=100
+插件自身采样: 372 -> 374  running=1 auto_stop=0
+```
+
+- `落在本模块` 必须 > 0 —— 说明采样能正确归因
+- `插件自身采样` 后面的数必须**比前面大** —— 说明插件自己的采样线程真在采到东西
+- 退出码必须是 0
+
+> 忙线程会占满一个核，所以"单次采样最慢"几十毫秒是**正常的调度延迟**，不是缺陷。
+> 自检里的断言已按这个现实调整（只要求有上界 + 每轮都采到样本）。
+
 ## 11. GitHub Actions 自动编译
 
 仓库里已经带好了工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)。
