@@ -56,11 +56,12 @@ namespace {
 //   处理器看的是目标线程那份（全空），采样线程轮询的是自己那份（永远等不到），
 //   于是每一次采样都必然 20ms 超时、一个样本都拿不到。
 //
-// 正确做法：槽位表是【全进程共享】的普通全局数组，但给每个采样线程分配一段【私有区间】
-// （按 tid 算窗口起点），这样既跨线程可见，又不会两个采样者互相踩。
+// 正确答案分两步：
+//   a) 槽位表是【全进程共享】的普通全局数组（跨线程可见），每个采样线程按 tid 独占一格；
+//   b) 处理器【不靠扫表定位】，而是读 thread_local 的"当前请求槽位指针"直接写
+//      —— 这样即使进程里有多份本文件副本、处理器和发起者来自不同副本，也依然正确。
 //----------------------------------------------------------------------------------------
-const int kSlotsPerThread = 16;  // 每个采样线程独占的槽位数
-const int kMaxSlots = 4096;      // 槽位表总大小（够 256 个并发采样者）
+const int kMaxSlots = 512;  // 槽位表总大小（够 512 个并发采样线程）
 
 struct Slot {
     volatile int state;  // 0=空闲 1=已投递 2=已完成
@@ -69,9 +70,20 @@ struct Slot {
 
 // 全进程共享（不能用 thread_local，原因见上）
 static Slot g_slots[kMaxSlots];
-// 每个采样线程自己的窗口起点 + 窗口内游标
-static thread_local int g_slot_window = -1;
-static thread_local int g_slot_cursor = 0;
+// 本采样线程独占的槽位下标 + 是否已分配
+static thread_local int g_slot_index = -1;
+
+// 【关键】当前正在等待回填的槽位地址。
+//
+// 为什么必须用"指针"而不是让处理器自己去表里找：同一个进程里可能存在
+// 【多份本文件的副本】（perfstat_srv.so 一份、离线自检程序一份），
+// 每份各有自己的 g_slots 数组。信号处理器是进程级、后装覆盖先装的，
+// 于是处理器是 A 副本的、发起采样的是 B 副本 —— A 的处理器无论如何都扫不到
+// B 的槽位表（那是另一块内存），采样必然全部超时。
+//
+// 而"当前请求槽位的地址"通过 thread_local 传递：处理器运行在【发起采样的那个线程】上，
+// 读到的就是这个线程写下的地址，天然跨副本正确。
+static thread_local Slot *g_pending_slot = 0;
 
 int g_sig = -1;
 bool g_inited = false;
@@ -97,14 +109,13 @@ static volatile long g_handler_miss = 0;   // 进了处理器但窗口内没有 
 #define PS_UC_IP(uc) (0UL)
 #endif
 
-// 给当前采样线程分配一段槽位窗口（第一次调用时算，之后复用）
-static int slot_window_base() {
-    if (g_slot_window < 0) {
+// 给当前采样线程分配一个独占槽位（第一次调用时算，之后复用）
+static int slot_for_this_thread() {
+    if (g_slot_index < 0) {
         unsigned long tid = (unsigned long)syscall(SYS_gettid);
-        int window = (int)(tid % (unsigned long)(kMaxSlots / kSlotsPerThread));
-        g_slot_window = window * kSlotsPerThread;
+        g_slot_index = (int)(tid % (unsigned long)kMaxSlots);
     }
-    return g_slot_window;
+    return g_slot_index;
 }
 
 // 信号处理器里怎么知道该写哪个槽位？
@@ -116,42 +127,25 @@ void ps_signal_handler(int, siginfo_t *, void *vctx) {
     ucontext_t *uc = (ucontext_t *)vctx;
     unsigned long ip = PS_UC_IP(uc);
 
-    // 1) 先在"发起采样的那个线程"的私有窗口里找待回填的槽位。
-    //    g_slot_window 是 thread_local，而处理器运行在发起采样的线程上，
-    //    所以这里读到的正是发起者的窗口（绝大多数情况走这条）。
-    int base = g_slot_window < 0 ? 0 : g_slot_window;
-    int end = base + kSlotsPerThread;
-    if (end > kMaxSlots) end = kMaxSlots;
-    for (int i = base; i < end; ++i) {
-        if (__atomic_load_n(&g_slots[i].state, __ATOMIC_ACQUIRE) == 1) {
-            g_slots[i].ip = ip;
-            __atomic_store_n(&g_slots[i].state, 2, __ATOMIC_RELEASE);
-            return;
-        }
+    // 直接写"发起采样的那个线程"正在等的槽位：地址通过 thread_local 传过来，
+    // 处理器运行在同一个线程上，所以这个指针一定指向正确的那张表
+    // （即使发起者和处理器来自不同副本也没问题）。
+    Slot *slot = g_pending_slot;
+    if (slot) {
+        slot->ip = ip;
+        __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
+        return;
     }
 
-    // 2) 退路：扫全表，用原子操作认领任意 state==1 的槽位。
-    //
-    // 【为什么必须有这条退路】同一个进程里可能存在【多份本文件的副本】——
-    // 例如 perfstat_srv.so 里一份、离线自检程序里一份。信号处理器是进程级的、
-    // 后装的会覆盖先装的，而 g_slots / g_slot_window 却是每份副本各自的。
-    // 于是会出现"处理器是 A 副本的，但发起采样的是 B 副本"的情况：
-    // A 的处理器只看 A 的窗口（里面什么都没有），B 的槽位永远等不到回填，
-    // 表现就是每次采样都卡满 20ms 超时、一个样本都拿不到。
-    //
-    // 用 CAS 认领：只有把 state 从 1 抢到 3 的那个处理器才写 ip，
-    // 所以多个处理器同时进来也不会把同一个槽位写两次。
-    for (int i = 0; i < kMaxSlots; ++i) {
-        int expected = 1;
-        if (__atomic_compare_exchange_n(&g_slots[i].state, &expected, 3, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            g_slots[i].ip = ip;
-            __atomic_store_n(&g_slots[i].state, 2, __ATOMIC_RELEASE);
-            return;
-        }
+    // 退路：理论上不该走到这里（pending 指针总该有值）。
+    // 万一走到了，就退回"写本线程独占的那一格"这种老办法，尽量别丢样本。
+    int own = slot_for_this_thread();
+    if (__atomic_load_n(&g_slots[own].state, __ATOMIC_ACQUIRE) == 1) {
+        g_slots[own].ip = ip;
+        __atomic_store_n(&g_slots[own].state, 2, __ATOMIC_RELEASE);
+        return;
     }
 
-    // 没有任何槽位在等回填（理论上不该发生），丢掉即可
     __atomic_add_fetch(&g_handler_miss, 1, __ATOMIC_RELAXED);
 }
 
@@ -621,18 +615,6 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
     const pid_t pid = getpid();
     int count = 0;
 
-    {
-        static int dbg_targets = 0;
-        if (g_ps_debug && dbg_targets < 6) {
-            fprintf(stderr, "[perfstat-hb] targets(i0=%d,n=%d) self=%d ->", i0, n, (int)self);
-            for (int k = 0; k < n && k < 8; ++k) {
-                fprintf(stderr, " %d", tid_list[i0 + k]);
-            }
-            fprintf(stderr, "\n");
-            dbg_targets++;
-        }
-    }
-
     for (int k = 0; k < n && count < max_ips; ++k) {
         if (__atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE)) break;
         const int pos = i0 + k;
@@ -640,19 +622,20 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         const int tid = tid_list[pos];
         if (tid == self) continue;
 
-        // 在本线程的私有窗口内轮转（同一时刻只有一格是"已投递"状态）
-        const int base = slot_window_base();
-        const int idx = base + g_slot_cursor;
-        g_slot_cursor = (g_slot_cursor + 1) % kSlotsPerThread;
+        // 本线程独占的槽位（同一时刻只有这一个请求在飞）
+        const int idx = slot_for_this_thread();
 
         __atomic_store_n(&g_slots[idx].ip, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_slots[idx].state, 1, __ATOMIC_RELEASE);
+        // 告诉处理器"回填这一个槽位"（跨副本也正确）
+        g_pending_slot = &g_slots[idx];
 
         int tk = (int)syscall(SYS_tgkill, pid, tid, g_sig);
         if (tk != 0 && g_ps_debug) {
             fprintf(stderr, "[perfstat-hb] tgkill(tid=%d) FAILED rc=%d sig=%d\n", tid, tk, g_sig);
         }
         if (tk != 0) {
+            g_pending_slot = 0;
             __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
             continue;
         }
@@ -660,7 +643,6 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
         struct timespec start, now;
         clock_gettime(CLOCK_MONOTONIC, &start);
         for (;;) {
-            // 2 = 已回填；3 = 别的副本的处理器正在认领它，再等一会儿就到 2 了
             if (__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE) == 2) {
                 unsigned long ip = __atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE);
                 if (ip) {
@@ -684,18 +666,7 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
             tiny.tv_nsec = 200000;  // 0.2ms
             nanosleep(&tiny, 0);
         }
-        {
-            static int dbg_slots = 0;
-            if (g_ps_debug && dbg_slots < 10) {
-                int st = (int)__atomic_load_n(&g_slots[idx].state, __ATOMIC_ACQUIRE);
-                fprintf(stderr,
-                        "[perfstat-hb]   slot state=%d ip=%p tid=%d | handler_runs=%ld miss=%ld\n",
-                        st, (void *)__atomic_load_n(&g_slots[idx].ip, __ATOMIC_ACQUIRE), tid,
-                        (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED),
-                        (long)__atomic_load_n(&g_handler_miss, __ATOMIC_RELAXED));
-                dbg_slots++;
-            }
-        }
+        g_pending_slot = 0;
         __atomic_store_n(&g_slots[idx].state, 0, __ATOMIC_RELEASE);
     }
     return count;
@@ -723,9 +694,9 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     const int total = (int)tid_list.size();
     {
         static int dbg_calls = 0;
-        if (g_ps_debug && (dbg_calls < 3 || dbg_calls % 200 == 0)) {
+        if (g_ps_debug && (dbg_calls < 2 || dbg_calls % 500 == 0)) {
             fprintf(stderr,
-                    "[perfstat-hb] window: tids=%d self=%d sig=%d | handler_runs=%ld miss=%ld\n",
+                    "[perfstat-hb] ps_sample_window: tids=%d self=%d sig=%d handler_runs=%ld miss=%ld\n",
                     total, (int)syscall(SYS_gettid), g_sig,
                     (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED),
                     (long)__atomic_load_n(&g_handler_miss, __ATOMIC_RELAXED));

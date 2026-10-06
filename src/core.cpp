@@ -250,9 +250,11 @@ void Profiler::sampler_loop() {
                                          kSampleWindow);
         // 低频心跳：只在 verbose 下每 100 轮打一行。
         // 这条日志能把"采样线程根本没进循环"和"进了循环但一个样本都拿不到"区分开。
-        if (verbose_on() && (dbg_round < 3 || dbg_round % 100 == 0)) {
-            fprintf(stderr, "[perfstat-hb] sampler round %d: n=%d total=%llu\n", dbg_round, n,
-                    (unsigned long long)m_total_samples);
+        if (verbose_on() && (dbg_round < 2 || dbg_round % 500 == 0)) {
+            fprintf(stderr,
+                    "[perfstat-hb] sampler round %d: n=%d total=%llu running=%d threads=%d\n",
+                    dbg_round, n, (unsigned long long)m_total_samples, (int)m_running,
+                    (int)m_threads.size());
         }
         dbg_round++;
         for (int i = 0; i < n; ++i) apply_sample(m_ip_buffer[i], m_tid_buffer[i]);
