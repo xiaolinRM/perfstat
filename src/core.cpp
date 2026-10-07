@@ -31,6 +31,37 @@ static const size_t kMaxHotPerModule = 4096;
 // 为什么需要它：CI 日志里 stdout 是块缓冲（进程退出才刷）、stderr 无缓冲，
 // 两者交错后【行号完全不能代表时间顺序】—— 这个项目里因为误读顺序浪费过好几轮。
 //----------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------
+// 报告阶段标记 + VEH（向量化异常处理器）
+//
+// 见 core.h 的说明：report() 每进入一个阶段就更新 ps_report_phase，
+// 而 VEH 在访问违例发生时把这个标记打出来 —— 这样"崩在哪一段"就不用猜了。
+//----------------------------------------------------------------------------------------
+const char *ps_report_phase = "(none)";
+
+#if defined(_MSC_VER)
+static LONG WINAPI ps_veh_handler(EXCEPTION_POINTERS *info) {
+    unsigned int code = (info && info->ExceptionRecord) ? info->ExceptionRecord->ExceptionCode : 0;
+    if (code == 0xC0000005u || code == 0xC000001Du || code == 0xC0000094u) {
+        void *addr = info->ExceptionRecord->ExceptionAddress;
+        fprintf(stderr, "[perfstat] 异常诊断: code=0x%08X addr=%p 阶段='%s'\n", code, addr,
+                ps_report_phase ? ps_report_phase : "?");
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;  // 只做诊断，不吞异常
+}
+
+bool ps_install_crash_diag() {
+    static bool installed = false;
+    if (installed) return true;
+    // 参数 1 = 放在最前面调用，保证比 SEH 处理器先拿到异常
+    installed = AddVectoredExceptionHandler(1, ps_veh_handler) != 0;
+    return installed;
+}
+#else
+bool ps_install_crash_diag() { return true; }
+#endif
+
 extern "C" double ps_dbg_now_ms(void) {
     static double base = 0.0;
     double t = ps_now_seconds() * 1000.0;
@@ -492,12 +523,18 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
     // 注意顺序：必须先收集内存，再取快照。
     // 之前是先 take_snapshot() 再 collect_memory_locked()，于是内存数据永远晚一拍
     // 才写进快照，报告里那一列永远是 0。
+    //
+    // 每个阶段都设一个"阶段标记"（g_report_phase）。配合 VEH（见 core.h 的说明），
+    // 万一某一段访问违例，日志会直接打出是哪一段 —— 不用再靠猜。
+    ps_report_phase = "collect_memory";
     if (!opt.no_memory) {
         AutoLock lk(m_lock, "report/collect_memory");
         collect_memory_locked();
     }
+    ps_report_phase = "take_snapshot";
     Snapshot s;
     take_snapshot(s);
+    ps_report_phase = "sort";
 
     m_out = out;
     m_out_user = user;
@@ -510,6 +547,7 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
     }
     if (elapsed < 0.0001) elapsed = 0.0001;
 
+    ps_report_phase = "sort_cpu";
     // ---- 排序：CPU ----
     std::vector<Snapshot::Row *> by_cpu;
     by_cpu.reserve(s.rows.size());
@@ -561,6 +599,7 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
     emit("                未命中任何模块的采样不参与百分比，因此各列之和会略小于 100%%。\n");
     emit("--------------------------------------------------------------------------------\n");
 
+    ps_report_phase = "emit";
     // ---- 表头 ----
     emit(" #  CPU%%   MODULE                          MEM(MB)  内存排名   内存构成\n");
     emit("--------------------------------------------------------------------------------\n");

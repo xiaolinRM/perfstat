@@ -860,6 +860,8 @@ PerfStatPlugin::PerfStatPlugin()
 bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn) {
     g_vlog_t0 = ps::ps_now_seconds();
     vlog("Load: begin");
+    // 安装异常诊断（VEH）：万一访问违例，日志会打出当时所处的报告阶段，便于定位
+    ps::ps_install_crash_diag();
     ps_platform_init();
     // 应用"只统计运行态线程"设置（默认开；这是让 CPU 占比有意义的关键，详见 platform.h）
     ps_set_cpu_state_filter(g_config.cpu_state_filter ? 1 : 0);
