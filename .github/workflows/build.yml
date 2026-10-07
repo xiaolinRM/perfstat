@@ -395,9 +395,18 @@ jobs:
           unzip -l perfstat-all-platforms.zip | head -30
           ls -l perfstat-all-platforms.zip
 
+      # 【artifact 名字故意和里面的 zip 不同名】
+      #
+      # 这是关键：GitHub 会把 artifact 打成"以 artifact 名命名的 zip"。
+      # 之前 artifact 叫 perfstat-all-platforms，里面装的 zip 也叫
+      # perfstat-all-platforms.zip —— 用户解压后看到的就是"一个同名 zip"，
+      # 看起来像"重复打包"（其实那个 zip 内部结构是正确的，只有两个平台目录）。
+      #
+      # 改名后两者不同，一眼能分清：
+      #   下载的 perfstat-bundle.zip -> perfstat-all-platforms.zip -> 两个平台目录
       - name: 上传总包
         uses: actions/upload-artifact@v4
         with:
-          name: perfstat-all-platforms
+          name: perfstat-bundle
           path: perfstat-all-platforms.zip
           if-no-files-found: error

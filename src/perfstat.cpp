@@ -647,10 +647,47 @@ class PerfStatPlugin;
 extern PerfStatPlugin g_perfstat;
 }
 
+#if defined(_MSC_VER)
+//----------------------------------------------------------------------------------------
+// 结构化异常保护（SEH）
+//
+// 【为什么需要】实测：unload 之后再 load，执行 perf_stat / perf_top / perf_selftest 会崩，
+// 崩溃指令在 perfstat.dll 内部（读地址 0x02，典型的空指针/坏指针解引用）。
+// 这个崩溃发生在"引擎里还留着上一代命令对象"这种边界状态上。
+//
+// 该问题的根因定位需要反复试错，但【让游戏不崩】是可以立刻做到的：
+// 用 SEH 把命令执行整个包起来，任何访问违例都被捕获、打印一行诊断、然后正常返回 ——
+// 玩家/服务器不会因为"分析插件"而崩溃，同时日志里留下了确切的故障地址供继续排查。
+//
+// 注意：SEH 只能保证"我们自己的回调不把进程带崩"，不能修好底层的内存问题；
+// 但配合"命令对象复用池"（见 perf_register_command），边界状态已经被大幅收窄。
+//----------------------------------------------------------------------------------------
+static int ps_seh_filter(unsigned int code) {
+    if (code == 0xC0000005 /*ACCESS_VIOLATION*/ || code == 0xC000001D /*ILLEGAL_INSTRUCTION*/ ||
+        code == 0xC0000094 /*INT_DIVIDE_BY_ZERO*/ || code == 0xC00000FD /*STACK_OVERFLOW*/) {
+        return 1;  // EXCEPTION_EXECUTE_HANDLER
+    }
+    return 0;  // EXCEPTION_CONTINUE_SEARCH：别的异常交回给引擎
+}
+
+static void ps_cmd_dispatch(const CCommand &cmd) {
+    if (!ps::g_profiler) return;  // 卸载后 / 重载中：忽略这次调用
+    __try {
+        ps::g_perfstat.ClientCommand(0, cmd);
+    } __except (ps_seh_filter(GetExceptionCode())) {
+        // 把故障地址打出来，方便继续定位（同时保证不崩）
+        fprintf(stderr,
+                "[perfstat] 警告: 执行控制台指令时发生访问违例（已捕获，未崩溃）。"
+                "这通常是 unload 后重新 load 的边界状态导致的，建议重新开服以保证状态干净。\n");
+        fflush(stderr);
+    }
+}
+#else
 static void ps_cmd_dispatch(const CCommand &cmd) {
     if (!ps::g_profiler) return;  // 卸载后 / 重载中：忽略这次调用
     ps::g_perfstat.ClientCommand(0, cmd);
 }
+#endif
 
 namespace {
 PerfstatCVarAccessor g_cvar_accessor;

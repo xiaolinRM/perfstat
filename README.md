@@ -987,33 +987,37 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-### 11.2 下载到的产物是什么结构
+### 11.2 下载到的产物是什么结构（重要，别被"套了两层"绕晕）
 
-artifact 里放的是**解包后的文件**（不是 zip），所以下载下来解压一次就到位：
-
-```
-下载的 artifact 包（GitHub 生成的 zip）
-├── addons/
-│   ├── perfstat.dll          （Windows 平台；Linux 是 perfstat.so）
-│   ├── perfstat.vdf
-│   └── perfstat.ini
-├── tests/                    （自检程序与日志）
-└── README.md
-```
-
-`perfstat-all-platforms.zip` 是唯一一个额外的 zip，里面是：
+**先说结论：GitHub Actions 的 artifact 本身就是一个 zip，这是它的机制，插件作者改不了。**
+所以"下载 → 解压 → 再解压"这个体感是正常的。三个 artifact 的真实结构：
 
 ```
-perfstat-windows/{addons,tests,README.md}
-perfstat-linux/{addons,tests,README.md}
+perfstat-windows.zip        (artifact)
+└── addons/{perfstat.dll, perfstat.vdf, perfstat.ini}
+    tests/
+    README.md
+        ← 解压一次就到位，里面没有任何 zip
+
+perfstat-linux.zip          (artifact)  同上，addons/perfstat.so
+
+perfstat-bundle.zip         (artifact)
+└── perfstat-all-platforms.zip           ← 这里面才是总包
+    ├── perfstat-windows/{addons,tests,README.md}
+    └── perfstat-linux/{addons,tests,README.md}
 ```
 
-> **为什么以前会看到"zip 里还有个同名 zip"**：早期版本把"打好包的 zip"当作 artifact
-> 的内容上传，而 artifact 本身又是个 zip，于是要解两次才见到文件。现在 artifact 里
-> 直接放文件，就没有这个问题了。
->
-> 另外 `download-artifact` 会为每个 artifact 名建一个子目录
-> （`artifacts/perfstat-windows/...`），这是它的固定行为，构建脚本里已按这个约定处理。
+**只有总包会看到两层**，因为总包本身就是一个 zip 文件，而承载它的 artifact 又必须是 zip。
+为了让这个"两层"不再看着像 bug，**artifact 名（`perfstat-bundle`）和里面的 zip 名
+（`perfstat-all-platforms.zip`）故意取成不同名** —— 否则会出现
+"下载 perfstat-all-platforms.zip，解压出来还是 perfstat-all-platforms.zip"这种纯属命名
+造成的错觉（用户反馈过，其实内部结构一直是对的）。
+
+> **历史坑（都已修）**：
+> 1. 早期把"打好包的 zip"当 artifact 内容上传 → 真的要解两次才见到文件。现在两个平台的
+>    artifact 里直接是文件，解一次到位。
+> 2. `download-artifact` 会为每个 artifact 名建子目录（`artifacts/perfstat-windows/...`），
+>    构建脚本里已按这个约定处理。
 
 | `perfstat-windows.zip` | `addons/perfstat.dll`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、两个自检 exe 与日志 |
 | `perfstat-linux.zip` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
