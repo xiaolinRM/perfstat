@@ -875,6 +875,26 @@ bool ps_keep_module_mapped() {
     return false;
 }
 
+// 线程累计 CPU 时间（内核+用户），单位纳秒。见 platform.h 的说明。
+unsigned long long ps_thread_cpu_time_ns(uint32_t tid) {
+    HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, (DWORD)tid);
+    if (!h) h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)tid);
+    if (!h) return 0;
+    FILETIME create, exit_, kernel, user;
+    unsigned long long ns = 0;
+    if (GetThreadTimes(h, &create, &exit_, &kernel, &user)) {
+        ULARGE_INTEGER k, u;
+        k.LowPart = kernel.dwLowDateTime;
+        k.HighPart = kernel.dwHighDateTime;
+        u.LowPart = user.dwLowDateTime;
+        u.HighPart = user.dwHighDateTime;
+        // FILETIME 单位是 100ns
+        ns = (k.QuadPart + u.QuadPart) * 100ULL;
+    }
+    CloseHandle(h);
+    return ns;
+}
+
 void ps_prepare_sampling_thread(void) {}
 
 void ps_request_stop_sampling(void) { stop_flag_set(1); }

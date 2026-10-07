@@ -53,6 +53,7 @@ Profiler::Profiler()
       m_tid_buffer(0),
       m_ip_capacity(0),
       m_total_samples(0),
+      m_total_weight_ns(0),
       m_sample_errors(0),
       m_start_time(0),
       m_last_time(0),
@@ -139,6 +140,7 @@ void Profiler::set_running(bool run) {
         m_start_time = ps_now_seconds();
         m_last_time = m_start_time;
         m_total_samples = 0;
+    m_total_weight_ns = 0;
         m_sample_errors = 0;
         m_running = true;
     } else {
@@ -164,6 +166,7 @@ void Profiler::reset() {
         }
         for (size_t i = 0; i < m_threads.size(); ++i) m_threads[i].hits = 0;
         m_total_samples = 0;
+    m_total_weight_ns = 0;
         m_sample_errors = 0;
         m_start_time = 0;
         m_last_time = 0;
@@ -196,7 +199,7 @@ int Profiler::find_module_by_addr(uintptr_t addr) const {
     return -1;
 }
 
-void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
+void Profiler::apply_sample(uintptr_t ip, uint32_t tid, unsigned long long weight_ns) {
     // 诊断：只在 verbose 下打点，而且每 100000 次才打一行（性能影响可忽略）。
     // 用来确认"采样回来的 IP 到底有没有进到统计里"。
     if (verbose_on()) {
@@ -220,6 +223,7 @@ void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
         for (size_t i = 0; i < m_threads.size(); ++i) {
             if (m_threads[i].tid == tid) {
                 m_threads[i].hits++;
+                m_threads[i].cpu_ns += weight_ns;  // 加权：该线程的真实 CPU 时间
                 found = true;
                 break;
             }
@@ -229,14 +233,17 @@ void Profiler::apply_sample(uintptr_t ip, uint32_t tid) {
             ThreadStat t;
             t.tid = tid;
             t.hits = 1;
+            t.cpu_ns = weight_ns;
             m_threads.push_back(t);
         }
     }
     int idx = find_module_by_addr(ip);
     m_total_samples++;
+    m_total_weight_ns += weight_ns;  // 总权重（CPU% 的分母）
     if (idx < 0) return;  // 落在模块之外（例如 JIT / 已卸载模块）
     ModuleStat &m = m_modules[idx];
     m.hits++;
+    m.weight_ns += weight_ns;
     uint32_t rva = (uint32_t)(ip - m.base);
     // 热点直方图：先线性找，找不到则追加（有上限）
     for (size_t k = 0; k < m.hot_list.size(); ++k) {
@@ -299,7 +306,45 @@ void Profiler::sampler_loop() {
                     (int)m_running);
         }
         dbg_round++;
-        for (int i = 0; i < n; ++i) apply_sample(m_ip_buffer[i], m_tid_buffer[i]);
+
+        //----------------------------------------------------------------------------------------
+        // 【按线程真实 CPU 时间加权】
+        //
+        // 对每个被采到的线程，查它当前的累计 CPU 时间，减去上次记录值 = 这段间隔里它
+        // 真实消耗的 CPU。把这个值当作该样本的权重交给 apply_sample。
+        //
+        // 效果：空闲线程（阻塞在 futex/WaitForSingleObject 里，IP 停在 ntdll/libc）
+        // 的 CPU 增量≈0 -> 权重≈0，不再把系统库抬到 90%+；真正在跑的线程权重高，
+        // 它 IP 所在的模块被正确凸显。而且权重是【精确测量】的，不是抽样估计。
+        //
+        // 注意：样本是"滑动窗口"采的（每轮只抓 window 个线程），所以同一线程的
+        // 两次读数间隔是若干轮 —— 这没问题，增量依然代表它在这段时间里的真实消耗，
+        // 只是被集中记到了这一票上（轮转是均匀的，长期统计依然公平）。
+        //----------------------------------------------------------------------------------------
+        for (int i = 0; i < n; ++i) {
+            uint32_t tid = m_tid_buffer[i];
+            unsigned long long now_ns = ps_thread_cpu_time_ns(tid);
+            unsigned long long weight = 0;
+            if (now_ns) {
+                // 找这个线程上次的读数（线程数通常几十~几百，线性找足够快）
+                bool found = false;
+                for (size_t k = 0; k < m_cpu_last.size(); ++k) {
+                    if (m_cpu_last[k].tid == tid) {
+                        if (now_ns > m_cpu_last[k].ns) weight = now_ns - m_cpu_last[k].ns;
+                        m_cpu_last[k].ns = now_ns;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && m_cpu_last.size() < 4096) {
+                    CpuLast cl;
+                    cl.tid = tid;
+                    cl.ns = now_ns;
+                    m_cpu_last.push_back(cl);  // 首次见到：没有增量可算，权重为 0
+                }
+            }
+            apply_sample(m_ip_buffer[i], tid, weight);
+        }
 
         double t1 = ps_now_seconds();
         double used = t1 - t0;
@@ -394,12 +439,16 @@ void Profiler::take_snapshot(Snapshot &s) {
     for (size_t i = 0; i < m_modules.size(); ++i) {
         const ModuleStat &m = m_modules[i];
         Snapshot::Row r;
+        // 【必须显式清零】Snapshot::Row 是聚合类型（没有构造函数），
+        // 不写这行 weight_ns 就是未初始化的垃圾值，会把加权 CPU% 算成天文数字（踩过）。
+        r.weight_ns = 0;
         r.name = m.name;
         r.path = m.path;
         r.base = m.base;
         r.size = m.size;
         r.is_main = m.is_main;
         r.hits = m.hits;
+        r.weight_ns = m.weight_ns;
         r.mem_mapped = m.mem_mapped;
         r.mem_private = m.mem_private;
         r.mem_other = m.mem_other;
@@ -410,6 +459,7 @@ void Profiler::take_snapshot(Snapshot &s) {
     }
     s.threads = m_threads;
     s.total = m_total_samples;
+    s.total_weight_ns = m_total_weight_ns;
     s.errors = m_sample_errors;
     s.start = m_start_time;
     s.last = m_last_time;
@@ -505,7 +555,9 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
          total > 0 ? (double)total / elapsed : 0.0);
     emit(" 模块数量     : %d        线程数量: %d\n", s.module_entries, (int)s.threads.size());
     emit(" 说明         : 采样是【统计抽样】，不是精确计时；时长越长、间隔越小越准。\n");
-    emit("                百分比 = 该模块命中采样数 / 总采样数（≈ 占满一个 CPU 核心的比例）。\n");
+    emit("                百分比 = 该模块的【加权 CPU 时间】/ 全部样本的加权 CPU 时间。\n");
+    emit("                权重 = 采样时测到的该线程真实 CPU 增量；所以阻塞中的空闲线程\n");
+    emit("                权重接近 0，不会把 ntdll / libc 这类系统库抬成大头。\n");
     emit("                未命中任何模块的采样不参与百分比，因此各列之和会略小于 100%%。\n");
     emit("--------------------------------------------------------------------------------\n");
 
@@ -525,7 +577,15 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
         size_t row_idx = (size_t)(&r - &s.rows[0]);
         if (row_idx >= mem_rank.size()) continue;  // 防御
         make_short(r.name, namebuf, 32);
-        double pct = total > 0 ? (double)r.hits * 100.0 / (double)total : 0.0;
+        // CPU% 按【加权 CPU 时间】算：分母是所有样本的权重之和，分子是该模块的权重之和。
+        // 这样空闲线程（权重≈0）不再把 ntdll/libc 抬到 90%+，真正在跑的模块才排得上号。
+        // 若权重不可用（平台拿不到线程 CPU 时间），自动退回按采样数计算。
+        double pct;
+        if (s.total_weight_ns > 0) {
+            pct = (double)r.weight_ns * 100.0 / (double)s.total_weight_ns;
+        } else {
+            pct = total > 0 ? (double)r.hits * 100.0 / (double)total : 0.0;
+        }
         shown++;
         emit("%2d %5.2f  %-32s %8.2f  #%-4d map %.1f / priv %.1f / other %.1f\n", shown, pct,
              namebuf, (double)mem_total / (1024.0 * 1024.0), mem_rank[row_idx],
@@ -600,7 +660,10 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
         for (size_t i = 0; i < th.size() && n < 40; ++i) {
             if (th[i].hits == 0) continue;
             emit("%2d %5.2f  %-8u %s\n", n + 1,
-                 total > 0 ? (double)th[i].hits * 100.0 / (double)total : 0.0, th[i].tid,
+                 s.total_weight_ns > 0
+            ? (double)th[i].cpu_ns * 100.0 / (double)s.total_weight_ns
+            : (total > 0 ? (double)th[i].hits * 100.0 / (double)total : 0.0),
+        th[i].tid,
                  th[i].name.empty() ? "(未命名)" : th[i].name.c_str());
             n++;
         }

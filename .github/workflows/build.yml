@@ -316,16 +316,43 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # artifact 里现在是解包后的【文件】，不是 zip，所以直接拷进 bundle/ 即可。
+      # artifact 里是解包后的【文件】，不是 zip。
       # download-artifact 会为每个 artifact 建一个子目录：
       #   artifacts/perfstat-windows/{addons,tests,README.md}
       #   artifacts/perfstat-linux/{addons,tests,README.md}
-      # 把它们各自整目录拷进 bundle/，得到：
-      #   bundle/perfstat-windows/...  bundle/perfstat-linux/...
+      - name: 下载两个平台的产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 检查下载结果
+        run: |
+          set -e
+          # 注意：不要写 `ls -R artifacts` —— 目录不存在时 ls 返回非 0，
+          # 在 set -e 下会直接让步骤以退出码 2 结束，把真正的错误掩盖掉（踩过：
+          # 上一版因为漏掉了 download-artifact 这一步，报错只显示 "cannot access artifacts"）。
+          if [ ! -d artifacts ]; then
+            echo "::error::download-artifact 没有下载到任何东西（artifacts/ 不存在）"
+            echo "::error::通常意味着 windows 或 linux job 在打包/上传之前就失败了，请看那两个 job 的日志。"
+            exit 1
+          fi
+          echo "=== artifacts/ 结构 ==="
+          find artifacts -maxdepth 3 | sort
+          for plat in perfstat-windows perfstat-linux; do
+            if [ ! -d "artifacts/$plat" ]; then
+              echo "::error::缺少 artifact: $plat"
+              exit 1
+            fi
+          done
+          test -f artifacts/perfstat-windows/addons/perfstat.dll || {
+            echo "::error::artifacts/perfstat-windows/addons/perfstat.dll 不存在"; exit 1; }
+          test -f artifacts/perfstat-linux/addons/perfstat.so || {
+            echo "::error::artifacts/perfstat-linux/addons/perfstat.so 不存在"; exit 1; }
+          echo "两个平台的 artifact 都齐了（且是解包后的文件，不是 zip）"
+
       - name: 合并成一个总包
         run: |
           set -e
-          ls -R artifacts
           rm -rf bundle && mkdir -p bundle
           cp -r artifacts/perfstat-windows bundle/perfstat-windows
           cp -r artifacts/perfstat-linux bundle/perfstat-linux

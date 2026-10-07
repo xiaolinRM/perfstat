@@ -1040,6 +1040,43 @@ long ps_handler_run_count(void) {
     return (long)__atomic_load_n(&g_handler_runs, __ATOMIC_RELAXED);
 }
 
+// 线程累计 CPU 时间（ns）。见 platform.h 的说明。
+// 优先读 /proc/<tid>/schedstat 第 1 个字段（内核直接给的运行时间，单位 ns，最准）；
+// 拿不到就退回 /proc/<tid>/stat 的 utime+stime（单位是时钟滴答，精度差一些）。
+unsigned long long ps_thread_cpu_time_ns(uint32_t tid) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/self/task/%u/schedstat", tid);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        unsigned long long runtime = 0;
+        int got = fscanf(f, "%llu", &runtime);
+        fclose(f);
+        if (got == 1) return runtime;
+    }
+    snprintf(path, sizeof(path), "/proc/self/task/%u/stat", tid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[2048];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    if (!rp) return 0;
+    int field = 3;
+    char *tok = strtok(rp + 2, " ");
+    unsigned long long utime = 0, stime = 0;
+    while (tok) {
+        if (field == 14) utime = strtoull(tok, 0, 10);
+        if (field == 15) stime = strtoull(tok, 0, 10);
+        field++;
+        tok = strtok(0, " ");
+    }
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    return (utime + stime) * 1000000000ULL / (unsigned long long)hz;
+}
+
 void ps_prepare_sampling_thread(void) {
     if (!g_inited) ps_platform_init();
     if (g_sig < 0) return;

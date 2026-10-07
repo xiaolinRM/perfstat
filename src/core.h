@@ -107,6 +107,9 @@ struct ModuleStat {
 
     // 运行期统计
     uint64_t hits;  // 该模块命中的采样数
+    // 加权命中：按线程在两次采样之间真实消耗的 CPU 时间累加。
+    // CPU% 用 weight_ns / total_weight_ns 算（见 apply_sample 的注释）。
+    unsigned long long weight_ns;
     uint64_t hot_capped;
     std::vector<HotSpot> hot_list;  // 每个不同偏移一条（偏移->命中数，线性查找 + 上限）
 
@@ -116,7 +119,7 @@ struct ModuleStat {
     size_t mem_other;
 
     ModuleStat()
-        : base(0), size(0), is_main(false), sym_handle(0), hits(0), hot_capped(0),
+        : base(0), size(0), is_main(false), sym_handle(0), hits(0), weight_ns(0), hot_capped(0),
           mem_mapped(0), mem_private(0), mem_other(0) {}
 };
 
@@ -124,6 +127,10 @@ struct ThreadStat {
     uint32_t tid;
     std::string name;
     uint64_t hits;
+    // 该线程的【加权 CPU 时间】（ns 累计，按采样时测到的真实 CPU 增量累加）。
+    // 用它做 CPU% 的分母，才不会让"大量空闲线程把系统库抬到 98%"。
+    unsigned long long cpu_ns;
+    ThreadStat() : tid(0), hits(0), cpu_ns(0) {}
 };
 
 // 输出目的地：控制台（由插件提供）或日志文件
@@ -175,7 +182,10 @@ public:
     int find_module_by_addr(uintptr_t addr) const;
 
     // 把一个采样到的指令地址计入统计（采样线程调用）
-    void apply_sample(uintptr_t ip, uint32_t tid);
+    // weight_ns = 该线程自上次采样以来真实消耗的 CPU 时间（ns）。
+    // 见 platform.h / ps_thread_cpu_time_ns 的说明：用它做加权归因，
+    // 空闲线程权重≈0，不会再把 ntdll/libc 抬到 90%+。
+    void apply_sample(uintptr_t ip, uint32_t tid, unsigned long long weight_ns = 0);
 
 private:
     struct Snapshot {
@@ -186,6 +196,8 @@ private:
             size_t size;
             bool is_main;
             uint64_t hits;
+            // 加权命中（按线程真实 CPU 时间累计），CPU% 用它算
+            unsigned long long weight_ns;
             size_t mem_mapped, mem_private, mem_other;
             std::vector<HotSpot> hot;
             uint64_t hot_capped;
@@ -194,6 +206,7 @@ private:
         std::vector<Row> rows;
         std::vector<ThreadStat> threads;
         uint64_t total;
+        unsigned long long total_weight_ns;  // 所有样本的权重之和
         long long errors;
         double start, last;
         bool running;
@@ -220,6 +233,14 @@ private:
     int m_ip_capacity;
 
     uint64_t m_total_samples;
+    unsigned long long m_total_weight_ns;
+
+    // 每个线程"上次读到的累计 CPU 时间"，用来算增量（见 sampler_loop 里的说明）
+    struct CpuLast {
+        uint32_t tid;
+        unsigned long long ns;
+    };
+    std::vector<CpuLast> m_cpu_last;
     long long m_sample_errors;
     double m_start_time;
     double m_last_time;
