@@ -358,6 +358,8 @@ public:
                                            float flOldValue) = 0;
     virtual void InstallConsoleDisplayFunc(void *pDisplayFunc) = 0;
     virtual void RemoveConsoleDisplayFunc(void *pDisplayFunc) = 0;
+
+    // 兼容旧接口用的别名（IConsoleDisplayFunc 的签名见下面 ConsoleDisplayFuncV1）
     virtual void ConsoleColorPrintf(const void *clr, const char *pFormat, ...) = 0;
     virtual void ConsolePrintf(const char *pFormat, ...) = 0;
 };
@@ -379,6 +381,24 @@ public:
     InstantiateInterfaceFn m_CreateFn;
     const char *m_pName;
     InterfaceReg *m_pNext;
+};
+
+//----------------------------------------------------------------------------------------
+// IConsoleDisplayFunc —— 引擎的"控制台显示回调"接口
+//
+// 【为什么要用它】实测：在 Windows 专用服务器（srcds.exe）上，ICvar::ConsolePrintf
+// 调用成功但输出【完全不出现在 console.log / 服务器控制台】。而 ICvar 提供了
+// InstallConsoleDisplayFunc —— 注册一个显示回调，引擎所有控制台输出都会经过它。
+//
+//   * 注册之后，引擎自己的 ConMsg/ConPrintf 输出也会流经我们的回调，
+//     所以我们把收到的文字直接写进自己的日志文件，就能拿到【完整、可靠】的输出。
+//   * 这是"绕过 ConsolePrintf 不生效"的正规做法。
+//----------------------------------------------------------------------------------------
+class IConsoleDisplayFunc {
+public:
+    virtual void ColorPrint(const void *clr, const char *pMessage) = 0;
+    virtual void Print(const char *pMessage) = 0;
+    virtual void DPrint(const char *pMessage) = 0;
 };
 
 #endif  // PERFSTAT_PLUGIN_API_H

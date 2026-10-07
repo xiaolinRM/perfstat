@@ -736,7 +736,6 @@ static int sample_tid_range(const std::vector<int> &tid_list, int i0, int n, uin
     const pid_t self = (pid_t)syscall(SYS_gettid);
     const pid_t pid = getpid();
     int count = 0;
-
     for (int k = 0; k < n && count < max_ips; ++k) {
         if (__atomic_load_n(&g_stop_sampling, __ATOMIC_ACQUIRE)) break;
         const int pos = i0 + k;

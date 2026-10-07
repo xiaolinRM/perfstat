@@ -22,7 +22,15 @@ CXX       = g++
 CXXFLAGS  = -m32 -std=c++11 -O2 -fPIC -fno-exceptions -fno-rtti -fno-strict-aliasing \
             -fvisibility=hidden -fvisibility-inlines-hidden -Wall -Wextra \
             -Wno-unused-parameter -DNDEBUG -DLINUX -D_stricmp=strcasecmp -D_strnicmp=strncasecmp
-LDFLAGS   = -m32 -shared -rdynamic -static-libgcc
+# 说明：
+#   -static-libgcc -static-libstdc++  【必须】
+#     服务端自带的 bin/libstdc++.so.6 往往比编译机上的旧。实测在 Ubuntu 22.04
+#     (gcc 11) 上编译出的 .so 拿到 L4D2 服务端会加载失败：
+#       failed to dlopen perfstat.so error=bin/libstdc++.so.6:
+#         version `GLIBCXX_3.4.29' not found
+#     把 libstdc++ / libgcc 静态链进去，插件就不依赖服务端的 C++ 运行库版本，
+#     在任何发行版上编出来都能直接跑（代价是 .so 稍大一点，完全值得）。
+LDFLAGS   = -m32 -shared -rdynamic -static-libgcc -static-libstdc++
 LIBS      = -lpthread -ldl -lm
 
 SRCDIR    = src

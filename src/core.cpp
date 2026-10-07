@@ -85,6 +85,10 @@ Profiler::Profiler()
       m_ip_capacity(0),
       m_total_samples(0),
       m_total_weight_ns(0),
+      m_auto_dump_cb(0),
+      m_auto_dump_user(0),
+      m_auto_dump_sec(0),
+      m_last_auto_dump(0),
       m_sample_errors(0),
       m_start_time(0),
       m_last_time(0),
@@ -300,6 +304,11 @@ static const int kSampleWindow = 24;
 // 由 perfstat.cpp 导出：离线自检打开 verbose 时置 1
 extern "C" int g_perfstat_verbose_flag;
 
+
+
+
+void dbg_log(const char *fmt, ...);  // ps::dbg_log，定义在 perfstat.cpp
+
 void Profiler::sampler_loop() {
     int cursor = 0;
     int dbg_round = 0;
@@ -321,6 +330,7 @@ void Profiler::sampler_loop() {
         int n = ps_sample_threads_window(m_ip_buffer, m_tid_buffer, m_ip_capacity, &cursor,
                                          kSampleWindow);
         double t_s1 = ps_now_seconds();
+        // 无条件诊断：采样窗口返回了几个、花了多久（服务端排查用）
         // 单次采样耗时异常必须报出来（这里【不依赖 verbose】）：
         // 正常应该只有毫秒级，一旦到了百毫秒以上就是严重问题，
         // 否则只会看到"某一轮之后就没动静了"，很容易误判成采样线程挂了。
@@ -375,6 +385,11 @@ void Profiler::sampler_loop() {
                 }
             }
             apply_sample(m_ip_buffer[i], tid, weight);
+        }
+
+        // 自动落盘检查（见 set_auto_dump 的注释：不依赖引擎帧回调）
+        if (should_auto_dump(ps_now_seconds())) {
+            if (m_auto_dump_cb) m_auto_dump_cb(m_auto_dump_user, m_auto_dump_path.c_str());
         }
 
         double t1 = ps_now_seconds();

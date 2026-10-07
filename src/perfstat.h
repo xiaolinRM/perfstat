@@ -52,7 +52,7 @@ static_assert(sizeof(CCommand) == 1288,
 static_assert(sizeof(void *) == 4,
               "必须编译成 32 位（/MACHINE:X86 或 -m32），L4D2 服务器是 32 位进程");
 
-#define PERFSTAT_VERSION "1.13.0"
+#define PERFSTAT_VERSION "1.15.0"
 
 namespace ps {
 
@@ -112,6 +112,10 @@ public:
     virtual void OnEdictAllocated(edict_t *edict) { (void)edict; }
     virtual void OnEdictFreed(const edict_t *edict) { (void)edict; }
 
+    // 生成报告并落盘。放在 public 是因为采样线程的自动落盘回调要用它
+    // （自动落盘不依赖引擎的 GameFrame，见 core.h 里 set_auto_dump 的说明）。
+    bool write_report_file(const std::string &explicit_path, std::string &out_path);
+
 private:
     void cmd_help();
     void cmd_selftest();  // 诊断：确认控制台输出通道 / 采样 / 落盘是否正常
@@ -121,7 +125,6 @@ private:
     void cmd_dump(int argc, const char **argv);
     void cmd_reset();
     void cmd_load();
-    bool write_report_file(const std::string &explicit_path, std::string &out_path);
 
     double m_last_auto_dump;
     bool m_dumped_once;

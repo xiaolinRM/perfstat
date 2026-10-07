@@ -196,17 +196,25 @@ ICvar *g_cvar_for_output = 0;
 ConMsgFn g_conmsg = 0;
 bool g_output_probed = false;
 
+//----------------------------------------------------------------------------------------
+// 输出通道探测 —— 【顺序很重要】
+//
+// 实测结论（L4D2 专用服务器，Windows 和 Linux 都一样）：
+//   ICvar::ConsolePrintf 调用成功、返回值正常，但文字【既不上服务器控制台，
+//   也不进 console.log】。而 tier0 的 ConMsg 是引擎自己打印控制台信息用的函数
+//   （引擎的 echo / 启动日志都走它），所以它一定能把文字送到控制台。
+//
+// 另一位使用者的反馈也印证了："ICvar::ConsolePrintf 在 L4D2 Linux 服务端上不输出，
+// 改用 tier0!ConMsg 就正常了"。
+//
+// 因此优先级调整为：ConMsg（最可靠） > ConsolePrintf（listen server 上可用） > stdout。
+//----------------------------------------------------------------------------------------
 void probe_output_channels() {
     if (g_output_probed) return;
     g_output_probed = true;
 
-    g_cvar_for_output = g_pCvar;
-    if (g_cvar_for_output) {
-        g_console_channel = 1;
-        return;
-    }
-
-    // host 进程里 tier0 一定在；模块名各平台不同，都试一遍
+    // 1) 首选 tier0!ConMsg —— 引擎自己打印控制台就是用它，各平台/各种服务器都可靠。
+    //    模块名各平台不同，都试一遍。
     static const char *kTier0[] = {"tier0.dll", "tier0_s.dll", "libtier0_srv.so",
                                    "libtier0.so", "tier0.so", 0};
     static const char *kFuncs[] = {"ConMsg", "Msg", 0};
@@ -227,8 +235,18 @@ void probe_output_channels() {
     }
     if (g_conmsg) {
         g_console_channel = 2;
+        g_cvar_for_output = g_pCvar;  // 仍留着，用于注册显示回调等辅助动作
         return;
     }
+
+    // 2) 退而求其次：ICvar::ConsolePrintf（listen server 上有效）
+    g_cvar_for_output = g_pCvar;
+    if (g_cvar_for_output) {
+        g_console_channel = 1;
+        return;
+    }
+
+    // 3) 兜底：stdout
     g_console_channel = 3;
 }
 
@@ -241,12 +259,156 @@ const char *console_channel_name() {
     }
 }
 
+
+
+//----------------------------------------------------------------------------------------
+// 诊断文件日志
+//
+// 【为什么需要】在专用服务器（srcds.exe -condebug）上实测：命令能执行、插件在
+// plugin_print 里也能看到，但 ICvar::ConsolePrintf 输出的文字【完全不出现在 console.log】。
+// 这种情况下没法靠"控制台输出"定位，所以加一条直接写文件的诊断通道：
+// 每次输出、走的哪条通道、命令有没有被调用，全部记到 PERFSTAT_DEBUG_LOG 指定的文件。
+//
+// 用环境变量 PERFSTAT_DEBUG_LOG 控制（值=日志路径）；不设就完全不产生文件，不影响运行。
+//----------------------------------------------------------------------------------------
+static FILE *g_dbg_file = 0;
+static bool g_dbg_inited = false;
+
+static void dbg_init() {
+    if (g_dbg_inited) return;
+    g_dbg_inited = true;
+#if defined(_WIN32)
+    char path[1024];
+    DWORD n = GetEnvironmentVariableA("PERFSTAT_DEBUG_LOG", path, sizeof(path));
+    if (n == 0 || n >= sizeof(path)) return;
+    g_dbg_file = fopen(path, "wb");
+#else
+    const char *path = getenv("PERFSTAT_DEBUG_LOG");
+    if (!path || !path[0]) return;
+    g_dbg_file = fopen(path, "wb");
+#endif
+}
+
+// 诊断日志默认关闭（只有设了 PERFSTAT_DEBUG_LOG 才会产生文件）。
+// 它记录的是"每条输出走了哪条通道"这类内部细节，属于排障用，日常应保持安静。
+void dbg_log(const char *fmt, ...) {
+    dbg_init();
+    if (!g_dbg_file) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_dbg_file, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_dbg_file);
+    fflush(g_dbg_file);  // 崩溃也要保住已写内容
+}
+
+
+void dbg_log(const char *fmt, ...);
+
+//----------------------------------------------------------------------------------------
+// 控制台显示回调
+//
+// 【为什么要注册它】实测：Windows 专用服务器（srcds.exe）上 ICvar::ConsolePrintf
+// 调用成功、返回值正常，但输出【完全不出现在 console.log 和服务器控制台】——
+// 插件看起来"没反应"。而 ICvar::InstallConsoleDisplayFunc 是引擎提供的正规扩展点：
+// 注册之后，引擎所有控制台输出都会流经我们的回调，我们把它写进日志文件即可。
+//
+// 这样即使引擎那边 ConsolePrintf 不显示，我们也能拿到完整输出。
+//----------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------
+// 用户可见的输出文件
+//
+// 【为什么需要】实测：Windows 专用服务器上 ICvar::ConsolePrintf 调用成功、返回值正常，
+// 但文字【完全不进 console.log，也不上服务器控制台】。引擎自己的 echo 能进 console.log，
+// 说明它的控制台输出走的是别的路径。
+//
+// 结论：在专用服务器上"靠引擎控制台显示插件输出"这条路不可靠。
+// 所以这里加一个【我们自己的输出文件】：所有 console_out 的文字都追加进去。
+// 用户 tail 这个文件就能看到全部输出，完全不受引擎控制台行为影响。
+//
+// 路径与 perfstat.dll 同目录：addons/perfstat-out.log
+//----------------------------------------------------------------------------------------
+#if defined(_WIN32)
+#define PS_PATH_SEP '\\\\'
+#else
+#define PS_PATH_SEP '/'
+#endif
+
+static FILE *g_out_file = 0;
+static bool g_out_inited = false;
+static char g_out_path[1200] = {0};
+
+// 插件自己所在的目录（定义在下面，这里先声明，output 文件初始化要用）
+std::string module_dir();
+
+// 输出文件放在插件自己所在目录（即 addons/）下的 perfstat-out.log。
+// 用 module_dir() 而不是工作目录：模块目录才是"用户放插件的地方"，两个平台一致，
+// 也不受服务端启动方式（srcds_run 脚本 / 直接跑 srcds_linux）影响。
+static void out_file_init() {
+    if (g_out_inited) return;
+    g_out_inited = true;
+
+    std::string md = module_dir();
+    if (!md.empty()) {
+        snprintf(g_out_path, sizeof(g_out_path), "%s%cperfstat-out.log", md.c_str(), PS_PATH_SEP);
+        g_out_file = fopen(g_out_path, "ab");
+        if (g_out_file) return;
+    }
+    // 兜底：工作目录
+    char cwd[900];
+#if defined(_WIN32)
+    DWORD n = GetCurrentDirectoryA(sizeof(cwd), cwd);
+    if (n == 0 || n >= sizeof(cwd)) return;
+#else
+    if (!getcwd(cwd, sizeof(cwd))) return;
+#endif
+    snprintf(g_out_path, sizeof(g_out_path), "%s%cperfstat-out.log", cwd, PS_PATH_SEP);
+    g_out_file = fopen(g_out_path, "ab");
+}
+
+const char *out_file_path() { return g_out_path; }
+
+void out_file_write(const char *text) {
+    out_file_init();
+    if (!g_out_file || !text) return;
+    fputs(text, g_out_file);
+    fflush(g_out_file);
+}
+
+class PerfstatDisplayFunc : public IConsoleDisplayFunc {
+public:
+    virtual void ColorPrint(const void *clr, const char *pMessage) {
+        (void)clr;
+        Print(pMessage);
+    }
+    // 注意：【不要】在这里写 out_file。
+    // 引擎会把我们 ConsolePrintf 的文字回送到这里，而 console_out 已经直接写过一次了 ——
+    // 两边都写会导致每条输出重复两遍（踩过）。
+    virtual void Print(const char *pMessage) { (void)pMessage; }
+    virtual void DPrint(const char *pMessage) { (void)pMessage; }
+};
+
+PerfstatDisplayFunc g_display_func;
+bool g_display_installed = false;
+
 void console_out(const char *text) {
     if (g_quiet || !text || !text[0]) return;
     probe_output_channels();
 
+    dbg_log("[console_out] channel=%d (%s) text=%s", g_console_channel, console_channel_name(),
+            text);
+    // 双保险：不管引擎那边显不显示，用户文件里一定有
+    out_file_write(text);
+
+    // 先试着注册显示回调（只成功一次；失败也不影响其他通道）
+    if (!g_display_installed && g_cvar_for_output) {
+        g_cvar_for_output->InstallConsoleDisplayFunc(&g_display_func);
+        g_display_installed = true;
+        dbg_log("[console_out] InstallConsoleDisplayFunc -> %p", (void *)&g_display_func);
+    }
+
     if (g_console_channel == 1 && g_cvar_for_output) {
-        // ConsolePrintf 是 printf 风格，这里 text 里可能有 % 号，用 %s 转发最安全
+        // ConsolePrintf 是 printf 风格，text 里可能有 % 号，用 %s 转发最安全
         g_cvar_for_output->ConsolePrintf("%s", text);
         return;
     }
@@ -254,7 +416,7 @@ void console_out(const char *text) {
         g_conmsg("%s", text);
         return;
     }
-    // 兜底：换行符在部分 Windows 控制台下需要 \r\n 才能正确刷新
+    // 兜底：部分 Windows 控制台需要 \r\n 才能正确刷新
     fputs(text, stdout);
     fflush(stdout);
 }
@@ -296,6 +458,46 @@ std::string exe_dir() {
     std::string s(buf);
     size_t p = s.find_last_of('/');
     return p == std::string::npos ? std::string(".") : s.substr(0, p);
+#endif
+}
+
+// 插件自己所在的目录（"和插件放在一起"的真正含义）。
+//
+// 【为什么不能用 exe_dir()】服务端进程是 srcds_linux / srcds.exe，它的目录是游戏根目录，
+// 不是 addons/。实测：Linux 上把 perfstat.ini 放进 addons/，插件却跑去根目录找，
+// 于是配置永远读不到（横幅里连"配置:"那一行都没有）—— 排查了一轮才定位到。
+//
+// 用"本模块自身的路径"才准确：
+//   Linux  : dladdr(本模块内某个函数) -> dli_fname 即 /path/to/addons/perfstat.so
+//   Windows: GetModuleHandleExW(FROM_ADDRESS) 拿本 DLL 句柄，再 GetModuleFileNameW
+std::string module_dir() {
+#if defined(_WIN32)
+    HMODULE self = 0;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)(const void *)&module_dir, &self) ||
+        !self) {
+        return std::string();
+    }
+    wchar_t wbuf[2048];
+    DWORD n = GetModuleFileNameW(self, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0]) - 1));
+    if (n == 0) return std::string();
+    wbuf[n] = 0;
+    char buf[4096];
+    int m = WideCharToMultiByte(CP_ACP, 0, wbuf, -1, buf, (int)sizeof(buf) - 1, 0, 0);
+    if (m <= 0) return std::string();
+    buf[m] = 0;
+    std::string s(buf);
+    size_t p = s.find_last_of("\\/");
+    return p == std::string::npos ? std::string() : s.substr(0, p);
+#else
+    Dl_info info;
+    if (!dladdr((void *)(const void *)&module_dir, &info) || !info.dli_fname) {
+        return std::string();
+    }
+    std::string s(info.dli_fname);
+    size_t p = s.find_last_of('/');
+    return p == std::string::npos ? std::string() : s.substr(0, p);
 #endif
 }
 
@@ -376,11 +578,17 @@ volatile bool g_thread_alive = false;
 
 void sampler_entry() {
     g_thread_alive = true;
+    dbg_log("[sampler] 线程已启动");
     // 第一步：确保本线程能收到采样信号（掩码是继承来的，可能被创建者屏蔽了）
     ps::ps_prepare_sampling_thread();
+    dbg_log("[sampler] prepare 完成 stop=%d running=%d profiler=%p",
+            (int)ps::ps_stop_requested(), ps::g_profiler ? (int)ps::g_profiler->running() : -1,
+            (void *)ps::g_profiler);
     while (!g_thread_stop) {
         if (ps::g_profiler && ps::g_profiler->running()) {
+            dbg_log("[sampler] 进入 sampler_loop");
             ps::g_profiler->sampler_loop();
+            dbg_log("[sampler] sampler_loop 返回");
         } else {
 #if defined(_WIN32)
             Sleep(50);
@@ -411,6 +619,7 @@ pthread_t g_thread = 0;
 
 bool start_sampler_thread() {
     g_thread_stop = false;
+    dbg_log("[sampler] start_sampler_thread 调用");
 #if defined(_WIN32)
     if (g_thread_handle) return true;
     uintptr_t h = _beginthreadex(0, 0, sampler_entry_win, 0, 0, 0);
@@ -588,10 +797,17 @@ void load_config_file(const std::string &path) {
 }
 
 std::string config_path() {
+    // 【顺序很重要】插件自己的目录（addons/）优先 —— 插件和配置放一起最省心。
+    // 用 module_dir() 而不是 exe_dir()：后者的"exe"是 srcds 进程，位于游戏根目录，
+    // 在 Linux 上会导致 addons/perfstat.ini 永远读不到（实测踩过）。
     std::vector<std::string> candidates;
-    candidates.push_back(join_path(cwd_dir(), "perfstat.ini"));
-    candidates.push_back(join_path(exe_dir(), "perfstat.ini"));
-    candidates.push_back(join_path(join_path(exe_dir(), "cfg"), "perfstat.ini"));
+    std::string md = module_dir();
+    if (!md.empty()) {
+        candidates.push_back(join_path(md, "perfstat.ini"));            // addons/perfstat.ini
+        candidates.push_back(join_path(join_path(md, "cfg"), "perfstat.ini"));  // addons/cfg/
+    }
+    candidates.push_back(join_path(cwd_dir(), "perfstat.ini"));         // 服务器根目录（兼容旧用法）
+    candidates.push_back(join_path(exe_dir(), "perfstat.ini"));         // 兜底
     for (size_t i = 0; i < candidates.size(); ++i) {
         if (file_exists(candidates[i])) return candidates[i];
     }
@@ -616,6 +832,19 @@ extern Profiler *g_profiler;
 class PerfStatPlugin;
 extern PerfStatPlugin g_perfstat;
 }
+
+// 供 core.cpp 使用：把诊断日志暴露成 ps 命名空间下的接口
+namespace ps {
+void dbg_log(const char *fmt, ...);
+void dbg_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[2048];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ::dbg_log("%s", buf);
+}
+}  // namespace ps
 
 static int ps_seh_filter(unsigned int code) {
     if (code == 0xC0000005 /*ACCESS_VIOLATION*/ || code == 0xC000001D /*ILLEGAL_INSTRUCTION*/ ||
@@ -857,6 +1086,13 @@ PerfStatPlugin g_perfstat;
 PerfStatPlugin::PerfStatPlugin()
     : m_last_auto_dump(0), m_dumped_once(false) {}
 
+// 采样线程定时触发的自动落盘（在采样线程上下文里执行，注意别做重活）
+static void ps_auto_dump_cb(void *, const char *explicit_path) {
+    if (!g_profiler) return;
+    std::string out;
+    g_perfstat.write_report_file(explicit_path ? std::string(explicit_path) : std::string(), out);
+}
+
 bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn) {
     g_vlog_t0 = ps::ps_now_seconds();
     vlog("Load: begin");
@@ -878,12 +1114,19 @@ bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn)
         g_profiler->set_auto_stop_sec(g_config.auto_stop_sec);
     }
 
+    // 自动落盘交给采样线程定时检查（引擎不调用 GameFrame，见 set_auto_dump 注释）
+    g_profiler->set_auto_dump(g_config.auto_dump_sec, g_config.auto_dump_path);
+    g_profiler->set_auto_dump_cb(ps_auto_dump_cb, 0);
+
     start_sampler_thread();
     vlog("Load: sampler thread started");
 
     // 取 ICvar 并注册控制台指令（不注册的话引擎会当成 Unknown command 直接丢掉）
     if (interfaceFactory) {
         g_pCvar = (ICvar *)interfaceFactory(CVAR_INTERFACE_VERSION, 0);
+        dbg_log("[Load] QueryInterface('%s') -> %p", CVAR_INTERFACE_VERSION, (void *)g_pCvar);
+    } else {
+        dbg_log("[Load] interfaceFactory 为空！");
     }
     if (g_pCvar) {
         ps_register_console_commands();
@@ -905,6 +1148,13 @@ bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn)
     console_out(" 指令: perf_help 查看全部指令；perf_stat 查看模块排名；perf_top 查看热点函数\n");
     console_out("       perf_dump 输出报告到 logs 目录；perf_start [间隔ms] [秒] 开始采样\n");
     console_out(" 提示: 采样是统计抽样，跑 1 分钟以上结论才可靠；不采样时几乎没有额外开销\n");
+    // 专用服务器（srcds.exe）上实测 ICvar::ConsolePrintf 的文字不会出现在 console.log，
+    // 所以所有指令输出都会同时写进这个文件 —— 必须在横幅里说清楚，否则用户会以为"没反应"。
+    {
+        char obuf[1300];
+        snprintf(obuf, sizeof(obuf), " 输出: 提示若控制台不显示，请看 %s\n", out_file_path());
+        console_out(obuf);
+    }
     if (!cfg.empty()) {
         char buf[600];
         snprintf(buf, sizeof(buf), " 配置: 已读取 %s\n", cfg.c_str());
@@ -965,10 +1215,12 @@ void PerfStatPlugin::Unload(void) {
 }
 
 void PerfStatPlugin::Pause(void) {
+    dbg_log("[callback] Pause");
     if (g_profiler) g_profiler->set_running(false);
 }
 
 void PerfStatPlugin::UnPause(void) {
+    dbg_log("[callback] UnPause");
     if (g_profiler) g_profiler->set_running(true);
 }
 
@@ -977,6 +1229,22 @@ const char *PerfStatPlugin::GetPluginDescription(void) {
 }
 
 void PerfStatPlugin::GameFrame(bool) {
+    // 无条件心跳：每约 5 秒记一次"帧回调还在不在、采样数涨没涨"。
+    // 服务端排查用（默认不产生文件，只有设了 PERFSTAT_DEBUG_LOG 才写）。
+    {
+        static int frames = 0;
+        static double last_hb = 0;
+        frames++;
+        double now_hb = ps::ps_now_seconds();
+        if (last_hb == 0) last_hb = now_hb;
+        if (now_hb - last_hb >= 5.0) {
+            last_hb = now_hb;
+            dbg_log("[GameFrame] frames=%d profiler=%p running=%d stop=%d total=%llu",
+                    frames, (void *)g_profiler, g_profiler ? (int)g_profiler->running() : -1,
+                    (int)ps::ps_stop_requested(),
+                    g_profiler ? (unsigned long long)g_profiler->total_samples() : 0ULL);
+        }
+    }
     if (!g_profiler) return;
     if (g_profiler->should_auto_stop()) {
         g_profiler->set_running(false);
@@ -1237,6 +1505,9 @@ static bool cmd_is(const CCommand &args, const char *name) {
 }
 
 PLUGIN_RESULT PerfStatPlugin::ClientCommand(edict_t *, const CCommand &args) {
+    dbg_log("[ClientCommand] argc=%d arg0='%s' g_profiler=%p g_pCvar=%p", args.ArgC(),
+            (args.ArgC() > 0 && args.Arg(0)) ? args.Arg(0) : "?", (void *)g_profiler,
+            (void *)g_pCvar);
     if (!g_profiler) return PLUGIN_CONTINUE;
 
     // 收集参数（最多 4 个）

@@ -165,6 +165,32 @@ public:
 
     // 自动停止（0 表示不自动停止）
     void set_auto_stop_sec(int sec) { m_auto_stop_sec = sec; }
+
+    // 定时自动落盘：由【采样线程】自己检查，不依赖引擎的帧回调。
+    // 为什么：实测 L4D2 专用服务器上引擎从不调用 IServerPluginCallbacks::GameFrame，
+    // 所以原来放在 GameFrame 里的 auto_dump 永远不会触发（踩过）。
+    // 采样线程本来就在按时跑，把这件事交给它最可靠。
+    void set_auto_dump(int sec, const std::string &path) {
+        m_auto_dump_sec = sec;
+        m_auto_dump_path = path;
+    }
+    bool should_auto_dump(double now) {
+        if (m_auto_dump_sec <= 0) return false;
+        if (m_last_auto_dump <= 0) {
+            m_last_auto_dump = now;
+            return false;
+        }
+        if (now - m_last_auto_dump >= (double)m_auto_dump_sec) {
+            m_last_auto_dump = now;
+            return true;
+        }
+        return false;
+    }
+    const char *auto_dump_path() const { return m_auto_dump_path.c_str(); }
+    void set_auto_dump_cb(void (*cb)(void *user, const char *explicit_path), void *user) {
+        m_auto_dump_cb = cb;
+        m_auto_dump_user = user;
+    }
     int auto_stop_sec() const { return m_auto_stop_sec; }
     bool should_auto_stop() const {
         return m_running && m_auto_stop_sec > 0 && elapsed_seconds() >= (double)m_auto_stop_sec;
@@ -248,6 +274,11 @@ private:
 
     uint64_t m_total_samples;
     unsigned long long m_total_weight_ns;
+    int m_auto_dump_sec;
+    std::string m_auto_dump_path;
+    double m_last_auto_dump;
+    void (*m_auto_dump_cb)(void *user, const char *explicit_path);
+    void *m_auto_dump_user;
 
     // 每个线程"上次读到的累计 CPU 时间"，用来算增量（见 sampler_loop 里的说明）
     struct CpuLast {
