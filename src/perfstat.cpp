@@ -626,12 +626,35 @@ public:
     }
 };
 
+// ---------------------------------------------------------------------------------------
+// profiler 实例指针 + 命令回调（放在全局作用域，早于下面的匿名命名空间）
+//
+// ps_cmd_dispatch 要作为回调传给 ConCommand，必须在命令注册代码之前可见；
+// 同时它要用 g_profiler 做空指针防护 —— 卸载后 / 重载中的窗口里直接忽略命令调用，
+// 避免访问未就绪的 profiler 状态而崩溃
+// （实测：unload 后 reload 再执行 perf_top，崩在 perfstat.dll 内、读地址 0x02）。
+//
+// g_profiler 的真实定义在下面的 namespace ps 里（因为 ClientCommand 在 ps 内），
+// 这里只做声明。
+// ---------------------------------------------------------------------------------------
+namespace ps {
+
+// g_profiler 的唯一定义（上面的 ps_cmd_dispatch 通过前置声明使用它）
+Profiler *g_profiler = 0;
+class Profiler;
+extern Profiler *g_profiler;
+class PerfStatPlugin;
+extern PerfStatPlugin g_perfstat;
+}
+
+static void ps_cmd_dispatch(const CCommand &cmd) {
+    if (!ps::g_profiler) return;  // 卸载后 / 重载中：忽略这次调用
+    ps::g_perfstat.ClientCommand(0, cmd);
+}
+
 namespace {
 PerfstatCVarAccessor g_cvar_accessor;
 
-
-// 指令回调：统一转发给插件实例的 ClientCommand（和引擎走的是同一条逻辑）
-void ps_cmd_dispatch(const CCommand &cmd) { ps::g_perfstat.ClientCommand(0, cmd); }
 
 //----------------------------------------------------------------------------------------
 // 【重要】命令指针存在自己的数组里，绝对不要用 SetNext/GetNext 维护"我们自己的链表"。
@@ -644,11 +667,53 @@ void ps_cmd_dispatch(const CCommand &cmd) { ps::g_perfstat.ClientCommand(0, cmd)
 // 用数组就没这个问题：注册了哪些命令我们自己清楚，遍历完全不依赖引擎怎么改写 m_pNext。
 //----------------------------------------------------------------------------------------
 static const int kMaxCommands = 64;
-ConCommand *g_cmd_list[kMaxCommands];
+
+//----------------------------------------------------------------------------------------
+// 【跨重载复用同一批命令对象】
+//
+// 为什么不能每次 Load 都 new 一批：卸载时我们刻意【不释放】这些对象（引擎侧可能仍持有
+// 指针），而引擎的命令表里可能还留着上一代的命令。如果重载时又 new 一批同名的，
+// 引擎里就会同时存在新旧两代同名命令：
+//   * 新命令的 m_pszName 指向 DSO 里的字符串字面量（一直有效）
+//   * 旧命令的 m_pszHelpString 等指针在重载后可能已经失效
+// 引擎遍历/链接这些命令时就会踩到坏指针（实测症状：unload 后 reload，执行
+// perf_stat / perf_top / perf_selftest 崩溃，崩溃指令在 perfstat.dll 内部读 0x02）。
+//
+// 改成"按名字查池子、命中就复用同一个对象"后，整个进程生命周期里每条命令只有一个对象，
+// 引擎无论持有哪一代的引用都指向同一个有效对象 —— 从根上消除这类悬空/重复问题。
+//
+// 注意：命令回调是模块内的静态函数，DSO 因为 keep_mapped 一直映射着，所以老对象调用
+// 老回调也没问题；而静态数据是同一个，所以老对象同样能看到重置后的 g_profiler。
+//----------------------------------------------------------------------------------------
+struct CmdSlot {
+    ConCommand *cmd;
+    const char *name;  // 指向字符串字面量，生命周期 = DSO 生命周期
+};
+static CmdSlot g_cmd_pool[kMaxCommands];
+ConCommand *g_cmd_list[kMaxCommands];  // 本次 Load 注册的命令（卸载时按它反注册）
 int g_cmd_count = 0;
 
 ConCommand *perf_register_command(const char *name, const char *help) {
-    ConCommand *cmd = new ConCommand(name, ps_cmd_dispatch, help, 0);
+    // 1) 先查池子：这条命令之前注册过就直接复用（不 new、不改名字）
+    ConCommand *cmd = 0;
+    for (int i = 0; i < kMaxCommands; ++i) {
+        if (g_cmd_pool[i].cmd && g_cmd_pool[i].name &&
+            strcmp(g_cmd_pool[i].name, name) == 0) {
+            cmd = g_cmd_pool[i].cmd;
+            break;
+        }
+    }
+    // 2) 没找到才新建，并放进池子
+    if (!cmd) {
+        cmd = new ConCommand(name, ps_cmd_dispatch, help, 0);
+        for (int i = 0; i < kMaxCommands; ++i) {
+            if (!g_cmd_pool[i].cmd) {
+                g_cmd_pool[i].cmd = cmd;
+                g_cmd_pool[i].name = name;
+                break;
+            }
+        }
+    }
     if (g_cmd_count < kMaxCommands) {
         g_cmd_list[g_cmd_count] = cmd;
         g_cmd_count++;
@@ -741,7 +806,6 @@ void ps_register_console_commands() {
 // 插件
 //----------------------------------------------------------------------------------------
 namespace ps {
-Profiler *g_profiler = 0;
 PerfStatPlugin g_perfstat;
 
 PerfStatPlugin::PerfStatPlugin()

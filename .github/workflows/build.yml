@@ -164,23 +164,33 @@ jobs:
             exit 1
           }
 
-      # 【不上传 zip，直接上传解包后的内容】
+      # 【上传"干净暂存目录"里的内容】
       #
-      # 为什么：GitHub 的 artifact 本身就是一个 zip，而且 download-artifact 会为每个
-      # artifact 名再建一个子目录。如果 artifact 里装的又是"一个 zip 文件"，用户下载后
-      # 就要解三次才见到文件，观感就是"zip 里还有个同名 zip"（用户反馈过两次）。
-      #
-      # 改成上传解包后的目录内容后：
-      #   下载的 artifact.zip  ->  perfstat-windows/{addons,tests,README.md}
-      # 解压一次就到位，里面再没有任何 zip。
+      # 为什么这么做：GitHub 的 artifact 本身就是一个 zip，如果 artifact 里再出现任何
+      # .zip 文件，用户解压后就会看到"zip 里还有 zip"（反馈过多次）。
+      # 与其依赖通配符的收集规则，不如先构造一个【确定不含任何 zip】的暂存目录，
+      # 在打包前主动扫一遍，确认没有 zip 再上传 —— 这样 upload 就绝无可能带上 zip。
+      - name: 准备上传目录（并确认里面没有任何 zip）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'upload-windows'
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Force dist\perfstat-windows\* $stage
+          $zips = @(Get-ChildItem -Recurse -File -Filter *.zip $stage)
+          if ($zips.Count -gt 0) {
+            Write-Error "暂存目录里出现了 zip（这会导致 artifact 里嵌套 zip）：$($zips.FullName -join ', ')"
+            exit 1
+          }
+          Write-Host "暂存目录内容（应无 zip）:"
+          Get-ChildItem -Recurse $stage | ForEach-Object { Write-Host "  $($_.FullName.Replace($PWD.Path + '\', ''))" }
+
       - name: 上传 Windows 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-windows
-          # 注意结尾的 \* ：只收目录【里面的内容】，
-          # 这样 artifact 解压出来直接是 addons/ tests/ README.md，
-          # 不会再套一层 perfstat-windows/。
-          path: dist/perfstat-windows/*
+          path: upload-windows
           if-no-files-found: error
 
   # ======================================================================================
@@ -296,12 +306,23 @@ jobs:
           ls -lR .
           echo "zip 大小: $(stat -c %s perfstat-linux.zip) 字节"
 
-      # 同 Windows：直接上传解包后的内容（不再上传 zip）
+      # 同 Windows：先造一个"确定不含 zip"的暂存目录，再上传
+      - name: 准备上传目录（并确认里面没有任何 zip）
+        run: |
+          set -e
+          rm -rf upload-linux && mkdir -p upload-linux
+          cp -r dist/perfstat-linux/. upload-linux/
+          if find upload-linux -name '*.zip' | grep -q .; then
+            echo "::error::暂存目录里出现了 zip，artifact 会嵌套"; find upload-linux -name '*.zip'; exit 1
+          fi
+          echo "暂存目录内容（应无 zip）:"
+          find upload-linux | sort
+
       - name: 上传 Linux 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-linux
-          path: dist/perfstat-linux/*
+          path: upload-linux
           if-no-files-found: error
 
   # ======================================================================================
