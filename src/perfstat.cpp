@@ -628,20 +628,34 @@ public:
 
 namespace {
 PerfstatCVarAccessor g_cvar_accessor;
-ConCommandBase *g_cmd_head = 0;  // 自己维护一份链表，方便卸载时反注册
-int g_cmd_count = 0;
+
 
 // 指令回调：统一转发给插件实例的 ClientCommand（和引擎走的是同一条逻辑）
 void ps_cmd_dispatch(const CCommand &cmd) { ps::g_perfstat.ClientCommand(0, cmd); }
 
+//----------------------------------------------------------------------------------------
+// 【重要】命令指针存在自己的数组里，绝对不要用 SetNext/GetNext 维护"我们自己的链表"。
+//
+// 原因：ConCommandBase::m_pNext 是【引擎的字段】。ICvar::RegisterConCommand 会用它把
+// 命令挂进引擎的全局命令链表（还会改写指针）。如果我们注册前先自己 SetNext 串一遍，
+// 引擎随后就会覆盖这条链 —— 于是卸载时按 GetNext() 遍历根本走不全，
+// 表现为"部分命令没被反注册、卸载后还能联想/help"（实测踩过）。
+//
+// 用数组就没这个问题：注册了哪些命令我们自己清楚，遍历完全不依赖引擎怎么改写 m_pNext。
+//----------------------------------------------------------------------------------------
+static const int kMaxCommands = 64;
+ConCommand *g_cmd_list[kMaxCommands];
+int g_cmd_count = 0;
+
 ConCommand *perf_register_command(const char *name, const char *help) {
     ConCommand *cmd = new ConCommand(name, ps_cmd_dispatch, help, 0);
-    cmd->SetNext(g_cmd_head);
-    g_cmd_head = cmd;
-    g_cmd_count++;
+    if (g_cmd_count < kMaxCommands) {
+        g_cmd_list[g_cmd_count] = cmd;
+        g_cmd_count++;
+    }
     if (g_pCvar) {
         g_pCvar->RegisterConCommand(cmd);
-        // 同 accessor：注册成功后必须置位，否则反注册会被引擎静默忽略
+        // 注册成功后必须置位，否则反注册会被引擎静默忽略（详见 plugin_api.h 的说明）
         cmd->SetRegistered(true);
     }
     return cmd;
@@ -668,21 +682,36 @@ ConCommand *perf_register_command(const char *name, const char *help) {
 //----------------------------------------------------------------------------------------
 void perf_unregister_commands() {
     vlog("unregister: begin (%d commands)", g_cmd_count);
+    int failed = 0;
     if (g_pCvar) {
-        for (ConCommandBase *p = g_cmd_head; p; p = p->GetNext()) {
+        for (int i = 0; i < g_cmd_count; ++i) {
+            ConCommandBase *p = g_cmd_list[i];
+            if (!p) continue;
+            bool was = p->IsRegistered();
             // 顺序很重要：先反注册（此时 IsRegistered() 必须仍是 true，
-            // 否则引擎会认为"没注册过"而跳过），成功后再把标志清掉。
-            vlog("unregister: UnregisterConCommand('%s') registered=%d",
-                 p->GetName() ? p->GetName() : "?", (int)p->IsRegistered());
+            // 否则引擎会认为"没注册过"而直接跳过），成功后再把标志清掉。
+            vlog("unregister: [%d] '%s' registered=%d -> UnregisterConCommand", i,
+                 p->GetName() ? p->GetName() : "?", (int)was);
             g_pCvar->UnregisterConCommand(p);
             p->SetRegistered(false);
+            // 反注册后引擎应当能再找到它（FindCommandBase 返回 0 才算真的移除了）
+            if (g_pCvar->FindCommandBase(p->GetName()) == p) {
+                failed++;
+                vlog("unregister: [%d] '%s' 反注册后引擎仍能找到它！", i,
+                     p->GetName() ? p->GetName() : "?");
+            }
         }
+    }
+    if (failed > 0) {
+        vlog("unregister: 有 %d 条命令反注册后仍留在引擎命令表里", failed);
+    } else {
+        vlog("unregister: 全部 %d 条命令都已从引擎命令表移除", g_cmd_count);
     }
     vlog("unregister: UnregisterConCommand done");
 
-    // 只把链表从我们这边摘掉，让重载时可以重新注册；对象内存【不释放】。
-    // （ConCommandBase::s_pNext 在引擎侧可能仍指向这些对象，见上面的说明）
-    g_cmd_head = 0;
+    // 只把我们这边的记录清掉，让重载时可以重新注册；对象内存【不释放】。
+    // （引擎侧可能仍持有这些对象的指针，见上面的说明）
+    for (int i = 0; i < g_cmd_count; ++i) g_cmd_list[i] = 0;
     g_cmd_count = 0;
     vlog("unregister: end (命令对象内存刻意保留，避免引擎侧 use-after-free)");
 }

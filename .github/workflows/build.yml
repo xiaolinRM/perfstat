@@ -164,27 +164,23 @@ jobs:
             exit 1
           }
 
-      # 【关键：把 zip 放到仓库根目录，再上传"没有目录前缀"的路径】
+      # 【不上传 zip，直接上传解包后的内容】
       #
-      # upload-artifact 在 path 含子目录时，会把"从最近公共父目录起的相对路径"一并打进
-      # artifact；对应地 download-artifact 也会把那个目录结构重建出来。于是
-      #   path: dist/perfstat-linux.zip  ->  下载后是 artifacts/perfstat-linux/dist/perfstat-linux.zip
-      # 用户就得先解 artifact、再解一层 dist/ 才拿到真正的 zip —— 看起来就是"zip 套 zip"。
+      # 为什么：GitHub 的 artifact 本身就是一个 zip，而且 download-artifact 会为每个
+      # artifact 名再建一个子目录。如果 artifact 里装的又是"一个 zip 文件"，用户下载后
+      # 就要解三次才见到文件，观感就是"zip 里还有个同名 zip"（用户反馈过两次）。
       #
-      # 现在把三个 zip 都放到仓库根目录，上传时 path 只有文件名（不含任何目录），
-      # download-artifact 就会平铺到 artifacts/ 下，不重建目录。
-      - name: 准备上传（把 zip 移到仓库根目录）
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Move-Item dist\perfstat-windows.zip .\perfstat-windows.zip -Force
-          Get-ChildItem perfstat-windows.zip | Select-Object Name, Length
-
+      # 改成上传解包后的目录内容后：
+      #   下载的 artifact.zip  ->  perfstat-windows/{addons,tests,README.md}
+      # 解压一次就到位，里面再没有任何 zip。
       - name: 上传 Windows 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-windows
-          path: perfstat-windows.zip
+          # 注意结尾的 \* ：只收目录【里面的内容】，
+          # 这样 artifact 解压出来直接是 addons/ tests/ README.md，
+          # 不会再套一层 perfstat-windows/。
+          path: dist/perfstat-windows/*
           if-no-files-found: error
 
   # ======================================================================================
@@ -300,18 +296,12 @@ jobs:
           ls -lR .
           echo "zip 大小: $(stat -c %s perfstat-linux.zip) 字节"
 
-      # 同 Windows：把 zip 移到仓库根目录，上传不含目录的路径
-      - name: 准备上传（把 zip 移到仓库根目录）
-        run: |
-          set -e
-          mv dist/perfstat-linux.zip ./perfstat-linux.zip
-          ls -l perfstat-linux.zip
-
+      # 同 Windows：直接上传解包后的内容（不再上传 zip）
       - name: 上传 Linux 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-linux
-          path: perfstat-linux.zip
+          path: dist/perfstat-linux/*
           if-no-files-found: error
 
   # ======================================================================================
@@ -326,30 +316,19 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 因为上传时 path 只有文件名，这里下载下来就是平铺的：
-      #   artifacts/perfstat-windows.zip
-      #   artifacts/perfstat-linux.zip
-      - name: 下载两个平台的产物
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      # 汇总包：把两个平台的产物解到 bundle/ 里，再打成【一个】zip。
-      #
-      # 关于"解压后还是 zip"：以前是 artifacts/ 下每个 artifact 一个 zip，用户要先解压
-      # artifact 再解压里面的 zip，共两层；而汇总包又把这两个 zip 再包一层。
-      # 现在统一成：汇总包解开就是 windows/ 和 linux/ 两个目录，直接能用。
+      # artifact 里现在是解包后的【文件】，不是 zip，所以直接拷进 bundle/ 即可。
+      # download-artifact 会为每个 artifact 建一个子目录：
+      #   artifacts/perfstat-windows/{addons,tests,README.md}
+      #   artifacts/perfstat-linux/{addons,tests,README.md}
+      # 把它们各自整目录拷进 bundle/，得到：
+      #   bundle/perfstat-windows/...  bundle/perfstat-linux/...
       - name: 合并成一个总包
         run: |
           set -e
           ls -R artifacts
           rm -rf bundle && mkdir -p bundle
-          # 两个平台的 zip 结构【刻意保持一致】：解开后各是一层与 zip 同名的目录
-          #   perfstat-windows/{addons,tests,README.md}
-          #   perfstat-linux/{addons,tests,README.md}
-          # 所以统一解到 bundle/ 下即可，bundle/ 里就是那两个目录。
-          unzip -q -o artifacts/perfstat-windows.zip -d bundle
-          unzip -q -o artifacts/perfstat-linux.zip -d bundle
+          cp -r artifacts/perfstat-windows bundle/perfstat-windows
+          cp -r artifacts/perfstat-linux bundle/perfstat-linux
           # 校验：bundle 里不应该有 zip，且两个平台的关键文件都在
           if find bundle -name '*.zip' | grep -q .; then
             echo "::error::汇总目录里残留了 zip"; find bundle -name '*.zip'; exit 1

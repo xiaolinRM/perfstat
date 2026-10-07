@@ -452,6 +452,41 @@ Source 的注册流程里，`IConCommandBaseAccessor::RegisterConCommandBase` �
 自检里加了 3 条断言把回归挡住：假 ICvar 现在会模仿真实引擎"`IsRegistered()==false` 就跳过"
 的行为，并统计被跳过次数（必须为 0）。
 
+**Q：`plugin_unload` 之后，资源管理器显示这个 dll 被占用，无法替换/删除？**
+
+**这是 `keep_mapped = 1`（默认）的必然结果，不是 bug。** 插件在 `Unload()` 结尾
+给自己 +1 了模块引用计数，引擎的 `FreeLibrary` 扣不掉它，模块就一直映射在进程里 ——
+所以文件被占用。
+
+为什么默认要这么做：只要引擎侧还残留任何指向我们内存的指针（命令对象、名字字符串、
+命令链表节点），模块一旦被 unmapped，它被访问就是崩溃（实测症状：卸载后在客户端
+输入框打一个字就崩，崩溃点 `gameui.dll` 读 NULL）。**而引擎的插件接口没有"卸载时
+通知引擎清理引用"的机制**，所以插件侧只能靠"别让模块真被卸掉"来自保。
+
+想要能删文件，把 `perfstat.ini` 里的 `keep_mapped` 设成 `0`（会真正卸载）。
+但请先确认命令注销是干净的 —— 见下一个问题。
+
+**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），输入没反应？**
+
+根因是**我们用 `m_pNext` 维护了自己的命令链表，而那是引擎的字段**：
+
+`ICvar::RegisterConCommand` 会用 `ConCommandBase::m_pNext` 把命令挂进**引擎自己的全局
+命令链表**，因此会**覆盖**我们注册前 `SetNext()` 串的那条链。结果卸载时
+`for (p = g_cmd_head; p; p = p->GetNext())` 根本走不全 —— 部分命令永远不会被反注册，
+就留在引擎命令表里：
+
+- 有联想词、`help xxx` 能看到描述、不报 Unknown command（命令还在表里）
+- 但对象在已卸载的模块里 → 输入没有反应
+- 再次 `plugin_load` 时每条指令都报
+  `WARNING: unable to link xxx and xxx because one or more is a ConCommand.`
+
+**修法（v1.8.0）**：命令指针改用**自己的固定数组**保存，遍历完全不依赖引擎怎么改写
+`m_pNext`。同时反注册后立刻用 `ICvar::FindCommandBase()` 回查一遍，确认引擎里真的
+找不到了才算成功（日志里会打印"全部 N 条命令都已从引擎命令表移除"）。
+
+> 另有一个更早的坑：注册成功后必须置 `m_bRegistered`（见下面那条 FAQ），
+> 否则引擎的 `UnregisterConCommand` 会因为 `IsRegistered()==false` 而静默跳过。
+
 **Q：CPU 占比几乎全落在 `ntdll.dll` / `libc.so.6` 上（90%+），看不出别的模块谁高谁低？**
 
 这是 v1.7.0 修的另一个真 bug，而且**是统计口径的问题，不是显示精度的问题**。
@@ -939,33 +974,33 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-### 11.2 下载到的产物是什么结构（重要，别被"套了两层"绕晕）
+### 11.2 下载到的产物是什么结构
 
-GitHub Actions 的 **artifact 本身就是一个 zip**（这是它的机制，插件作者无法改变），
-所以你会看到两层。这是正常的，照下面认就行：
+artifact 里放的是**解包后的文件**（不是 zip），所以下载下来解压一次就到位：
 
 ```
-下载的 artifact 包（Actions 生成的 zip）
-└── perfstat-windows.zip            ← 解一次得到这个
-    └── perfstat-windows/           ← 再解一次得到这个目录
-        ├── addons/
-        │   ├── perfstat.dll
-        │   ├── perfstat.vdf
-        │   └── perfstat.ini
-        ├── tests/                  （自检程序与日志）
-        └── README.md
+下载的 artifact 包（GitHub 生成的 zip）
+├── addons/
+│   ├── perfstat.dll          （Windows 平台；Linux 是 perfstat.so）
+│   ├── perfstat.vdf
+│   └── perfstat.ini
+├── tests/                    （自检程序与日志）
+└── README.md
 ```
 
-一句话：**artifact 解开 = 一个平台 zip；那个 zip 解开 = 一层 `perfstat-<平台>/` 目录**。
+`perfstat-all-platforms.zip` 是唯一一个额外的 zip，里面是：
 
-`perfstat-all-platforms.zip` 同理，解开后是 `perfstat-windows/` 和 `perfstat-linux/` 两个目录。
+```
+perfstat-windows/{addons,tests,README.md}
+perfstat-linux/{addons,tests,README.md}
+```
 
-> **两个平台 zip 的内部层级是刻意保持一致的**（都是"一层与 zip 同名的目录"），
-> 这样"汇总打包"才能统一解包。以前 Windows 压成了没有顶层目录的结构
-> （`addons/...` 直接在根），导致汇总步骤报"缺 windows 插件"（踩过）。
+> **为什么以前会看到"zip 里还有个同名 zip"**：早期版本把"打好包的 zip"当作 artifact
+> 的内容上传，而 artifact 本身又是个 zip，于是要解两次才见到文件。现在 artifact 里
+> 直接放文件，就没有这个问题了。
 >
-> 另外，如果你看到 **zip 里面又是同名 zip**（不是目录），那说明拿到的是旧版本 ——
-> 旧版本的 artifact 路径写的是 `dist/` 目录，upload-artifact 会把 `dist/` 这一层也打进去。
+> 另外 `download-artifact` 会为每个 artifact 名建一个子目录
+> （`artifacts/perfstat-windows/...`），这是它的固定行为，构建脚本里已按这个约定处理。
 
 | `perfstat-windows.zip` | `addons/perfstat.dll`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、两个自检 exe 与日志 |
 | `perfstat-linux.zip` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
