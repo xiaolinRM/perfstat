@@ -164,16 +164,27 @@ jobs:
             exit 1
           }
 
-      # 【只上传 zip 文件本身】不要把 dist/ 整个目录传上去 ——
-      # dist/ 里同时有解包目录 perfstat-windows/，一起上传的话 runner 会把两者都收进
-      # artifact（artifact 本身也是个 zip），于是用户下载解压后：
-      #   artifact.zip -> perfstat-windows.zip -> perfstat-windows/ 文件
-      # 就是"解压后还是同名 zip、再解压才是文件夹"的来源。
+      # 【关键：把 zip 放到仓库根目录，再上传"没有目录前缀"的路径】
+      #
+      # upload-artifact 在 path 含子目录时，会把"从最近公共父目录起的相对路径"一并打进
+      # artifact；对应地 download-artifact 也会把那个目录结构重建出来。于是
+      #   path: dist/perfstat-linux.zip  ->  下载后是 artifacts/perfstat-linux/dist/perfstat-linux.zip
+      # 用户就得先解 artifact、再解一层 dist/ 才拿到真正的 zip —— 看起来就是"zip 套 zip"。
+      #
+      # 现在把三个 zip 都放到仓库根目录，上传时 path 只有文件名（不含任何目录），
+      # download-artifact 就会平铺到 artifacts/ 下，不重建目录。
+      - name: 准备上传（把 zip 移到仓库根目录）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Move-Item dist\perfstat-windows.zip .\perfstat-windows.zip -Force
+          Get-ChildItem perfstat-windows.zip | Select-Object Name, Length
+
       - name: 上传 Windows 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-windows
-          path: dist/perfstat-windows.zip
+          path: perfstat-windows.zip
           if-no-files-found: error
 
   # ======================================================================================
@@ -289,12 +300,18 @@ jobs:
           ls -lR .
           echo "zip 大小: $(stat -c %s perfstat-linux.zip) 字节"
 
-      # 同上：只传 zip，不传 dist/ 目录
+      # 同 Windows：把 zip 移到仓库根目录，上传不含目录的路径
+      - name: 准备上传（把 zip 移到仓库根目录）
+        run: |
+          set -e
+          mv dist/perfstat-linux.zip ./perfstat-linux.zip
+          ls -l perfstat-linux.zip
+
       - name: 上传 Linux 产物
         uses: actions/upload-artifact@v4
         with:
           name: perfstat-linux
-          path: dist/perfstat-linux.zip
+          path: perfstat-linux.zip
           if-no-files-found: error
 
   # ======================================================================================
@@ -309,6 +326,9 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 因为上传时 path 只有文件名，这里下载下来就是平铺的：
+      #   artifacts/perfstat-windows.zip
+      #   artifacts/perfstat-linux.zip
       - name: 下载两个平台的产物
         uses: actions/download-artifact@v4
         with:
@@ -328,8 +348,8 @@ jobs:
           #   perfstat-windows/{addons,tests,README.md}
           #   perfstat-linux/{addons,tests,README.md}
           # 所以统一解到 bundle/ 下即可，bundle/ 里就是那两个目录。
-          unzip -q -o artifacts/perfstat-windows/perfstat-windows.zip -d bundle
-          unzip -q -o artifacts/perfstat-linux/perfstat-linux.zip -d bundle
+          unzip -q -o artifacts/perfstat-windows.zip -d bundle
+          unzip -q -o artifacts/perfstat-linux.zip -d bundle
           # 校验：bundle 里不应该有 zip，且两个平台的关键文件都在
           if find bundle -name '*.zip' | grep -q .; then
             echo "::error::汇总目录里残留了 zip"; find bundle -name '*.zip'; exit 1

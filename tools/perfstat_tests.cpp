@@ -354,7 +354,66 @@ static DWORD WINAPI sampler_thread(LPVOID) {
 
 static void file_out(void *user, const char *text) { fputs(text, (FILE *)user); }
 
+//----------------------------------------------------------------------------------------
+// 看门狗
+//
+// 【为什么必须有】自检之前没有超时保护，一旦在某一步变慢（例如 CI runner 线程很多、
+// 状态过滤的开销被放大），整个 job 就会一直挂着，只能等人发现（实测卡了 5 分钟以上）。
+// 这里加一个定时器：到点就把"当前卡在哪一步"打出来，然后强制退出，给出明确失败原因。
+//
+// 用 SetTimer + 后台线程实现（不依赖控制台/窗口，CI 里也能用）。
+//----------------------------------------------------------------------------------------
+static volatile int g_stage = 0;
+static const char *g_stages[] = {
+    "启动", "算法自检 1/2", "算法自检 3/4/5/6", "采样验证-启动线程",
+    "采样验证-3 秒被动采样（等采样线程）", "采样验证-交叉验证探测循环",
+    "采样验证-生成报告", "完成",
+};
+static HANDLE g_watchdog_thread = 0;
+static volatile int g_watchdog_stop = 0;
+static int g_watchdog_sec = 120;
+
+static DWORD WINAPI watchdog_thread(LPVOID) {
+    int waited = 0;
+    while (!g_watchdog_stop) {
+        Sleep(1000);
+        if (g_watchdog_stop) break;
+        if (++waited >= g_watchdog_sec) {
+            int st = g_stage;
+            if (st < 0 || st >= (int)(sizeof(g_stages) / sizeof(g_stages[0]))) st = 0;
+            // 用 stderr（无缓冲），确保这段话一定写得出来
+            fprintf(stderr, "\n[看门狗] 自检超过 %d 秒没结束，卡在这一步: %s\n", g_watchdog_sec,
+                    g_stages[st]);
+            fprintf(stderr, "[看门狗] 强制退出（退出码 2）。请把这一段发我。\n");
+            fflush(stderr);
+            fflush(stdout);
+            TerminateProcess(GetCurrentProcess(), 2);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void watchdog_start(int seconds) {
+    g_watchdog_sec = seconds;
+    g_watchdog_thread = CreateThread(0, 0, watchdog_thread, 0, 0, 0);
+}
+static void watchdog_stop() {
+    g_watchdog_stop = 1;
+    if (g_watchdog_thread) WaitForSingleObject(g_watchdog_thread, 3000);
+}
+static void stage(int s) {
+    g_stage = s;
+    // 同时写一份到 stderr（无缓冲），这样即使 stdout 被块缓冲也能看到进度
+    int n = (int)(sizeof(g_stages) / sizeof(g_stages[0]));
+    if (s >= 0 && s < n) {
+        fprintf(stderr, "[stage] %s\n", g_stages[s]);
+        fflush(stderr);
+    }
+}
+
 static void test_sampling() {
+    stage(3);  // 采样验证-启动线程
     printf("\n=== 验证 3: 10ms 采样 3 秒 -> 归因 -> 报告 ===\n");
 
     ps::Profiler profiler;
@@ -372,6 +431,7 @@ static void test_sampling() {
 
     profiler.set_running(true);
     HANDLE sampler = CreateThread(0, 0, sampler_thread, 0, 0, 0);
+    stage(4);  // 3 秒被动采样
     Sleep(3000);
 
     // 交叉验证：这里 busy/idle 线程还在跑，用平台采样接口独立取样本
@@ -379,6 +439,7 @@ static void test_sampling() {
     static uint32_t probe_tids[256];
     uint64_t self_hits = 0;
     int probe_total = 0;
+    stage(5);  // 交叉验证探测循环
     for (int round = 0; round < 20; ++round) {
         int n = ps::ps_sample_threads(probe_ips, probe_tids, 256);
         for (int i = 0; i < n; ++i) {
@@ -422,12 +483,23 @@ static void test_sampling() {
 
 int main(int, char **) {
     setvbuf(stdout, 0, _IONBF, 0);  // 崩溃时也能看到已经打印的内容
+    // 看门狗：正常情况下这个自检十几秒就结束；超过 120 秒说明某一步异常变慢
+    // （CI runner 上线程数很多时会放大采样开销），到点会把卡住的步骤打出来再退出，
+    // 而不是无限期挂着等人发现。
+    watchdog_start(120);
+    stage(0);
+
     printf("perfstat 自检工具\n");
     printf("================================================================================\n");
 
+    stage(1);
     test_abi();
+    stage(2);
     test_symbols();
     test_sampling();
+
+    stage(7);  // 完成
+    watchdog_stop();
 
     printf("\n================================================================================\n");
     printf("结果: 通过 %d 项, 失败 %d 项\n", g_pass, g_fail);

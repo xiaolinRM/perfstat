@@ -939,8 +939,36 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-| `perfstat-windows.zip` | `addons/perfstat.dll`、`perfstat.vdf`、`perfstat.ini`、`README.md`、两个自检 exe 与日志 |
-| `perfstat-linux.zip` | `addons/perfstat.so`、`perfstat.vdf`、`perfstat.ini`、`README.md`、Linux 自检程序与日志 |
+### 11.2 下载到的产物是什么结构（重要，别被"套了两层"绕晕）
+
+GitHub Actions 的 **artifact 本身就是一个 zip**（这是它的机制，插件作者无法改变），
+所以你会看到两层。这是正常的，照下面认就行：
+
+```
+下载的 artifact 包（Actions 生成的 zip）
+└── perfstat-windows.zip            ← 解一次得到这个
+    └── perfstat-windows/           ← 再解一次得到这个目录
+        ├── addons/
+        │   ├── perfstat.dll
+        │   ├── perfstat.vdf
+        │   └── perfstat.ini
+        ├── tests/                  （自检程序与日志）
+        └── README.md
+```
+
+一句话：**artifact 解开 = 一个平台 zip；那个 zip 解开 = 一层 `perfstat-<平台>/` 目录**。
+
+`perfstat-all-platforms.zip` 同理，解开后是 `perfstat-windows/` 和 `perfstat-linux/` 两个目录。
+
+> **两个平台 zip 的内部层级是刻意保持一致的**（都是"一层与 zip 同名的目录"），
+> 这样"汇总打包"才能统一解包。以前 Windows 压成了没有顶层目录的结构
+> （`addons/...` 直接在根），导致汇总步骤报"缺 windows 插件"（踩过）。
+>
+> 另外，如果你看到 **zip 里面又是同名 zip**（不是目录），那说明拿到的是旧版本 ——
+> 旧版本的 artifact 路径写的是 `dist/` 目录，upload-artifact 会把 `dist/` 这一层也打进去。
+
+| `perfstat-windows.zip` | `addons/perfstat.dll`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、两个自检 exe 与日志 |
+| `perfstat-linux.zip` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
 | `perfstat-all-platforms.zip` | 上面两个合并成一个总包（一次下载搞定） |
 
 工作流做了这些事：

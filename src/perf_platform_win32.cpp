@@ -552,6 +552,27 @@ bool thread_is_running(HANDLE hThread) {
     return wait_reason == 0;
 }
 
+//----------------------------------------------------------------------------------------
+// "运行态"检查结果缓存（每轮刷新一次）
+//
+// 【为什么必须缓存】一次采样要枚举进程里所有线程，每个线程都要判一次运行态。
+// 若每次都调 NtQueryInformationThread，在 CI 那种几百线程的 runner 上，
+// 单轮就是几百次系统调用 —— 自检里那个 20 轮 × 256 线程的探测循环会因此变得极慢
+// （实测在 GitHub runner 上卡到分钟级）。
+//
+// 缓存策略：每进入一轮采样就清空一次缓存（见 reset_state_cache），
+// 同一轮内相同 tid 只查一次。线程在轮内的状态变化本来就可忽略。
+//----------------------------------------------------------------------------------------
+struct StateCacheEntry {
+    DWORD tid;
+    bool known;
+    bool running;
+};
+static StateCacheEntry g_state_cache[2048];
+static int g_state_cache_n = 0;
+
+static void reset_state_cache() { g_state_cache_n = 0; }
+
 static uintptr_t peek_thread_ip(DWORD tid) {
     uintptr_t ip = 0;
     HANDLE h = OpenThread(PERFSTAT_THREAD_ACCESS, FALSE, tid);
@@ -561,9 +582,28 @@ static uintptr_t peek_thread_ip(DWORD tid) {
     // 阻塞在 WaitForSingleObject / WaitForMultipleObjects 等处的空闲线程，指令指针停在
     // ntdll 的 syscall 里；把它们算进来会把 ntdll 的占比抬到 90% 以上，报告失去意义。
     // 详见 thread_is_running 的说明。
-    if (g_state_filter && !thread_is_running(h)) {
-        CloseHandle(h);
-        return 0;
+    if (g_state_filter) {
+        bool running = true;
+        bool known = false;
+        for (int i = 0; i < g_state_cache_n; ++i) {
+            if (g_state_cache[i].tid == tid) {
+                running = g_state_cache[i].running;
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            running = thread_is_running(h);
+            if (g_state_cache_n < (int)(sizeof(g_state_cache) / sizeof(g_state_cache[0]))) {
+                g_state_cache[g_state_cache_n].tid = tid;
+                g_state_cache[g_state_cache_n].running = running;
+                g_state_cache_n++;
+            }
+        }
+        if (!running) {
+            CloseHandle(h);
+            return 0;
+        }
     }
 
     DWORD prev = SuspendThread(h);
@@ -624,6 +664,7 @@ int ps_sample_threads(uintptr_t *ips, uint32_t *tids, int max_ips) {
     if (!g_inited) ps_platform_init();  // 兜底：确保进程句柄等已就绪
     if (!ips || max_ips <= 0) return 0;
 
+    reset_state_cache();  // 每轮刷新一次"运行态"缓存（见上面的说明）
     static DWORD tid_buf[4096];
     int count = collect_process_tids(tid_buf, 4096);
     if (count > max_ips) count = max_ips;
@@ -634,6 +675,7 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *tids, int max_ips, int *c
     if (!g_inited) ps_platform_init();
     if (!ips || max_ips <= 0) return 0;
 
+    reset_state_cache();  // 每轮刷新一次"运行态"缓存
     static DWORD tid_buf[4096];
     int count = collect_process_tids(tid_buf, 4096);
     if (count <= 0) return 0;
