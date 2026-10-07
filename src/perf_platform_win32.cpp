@@ -52,6 +52,9 @@ bool g_inited = false;
 // 平台层自己的诊断开关（与 Linux 侧接口一致）
 static volatile int g_ps_debug = 0;
 
+// "只采样运行态线程"开关，默认开（见 platform.h 的详细说明）
+static volatile int g_state_filter = 1;
+
 // "尽快停止采样"标志（与 Linux 侧语义一致）
 // 这个文件不包含 compat.h（它是纯 C 风格的平台实现），所以直接用 MSVC 内部函数。
 static volatile long g_stop_sampling = 0;
@@ -494,10 +497,74 @@ static int collect_process_tids(DWORD *tids, int capacity) {
 
 // 挂起一个线程并取出它当前正在执行的指令地址（EIP）。
 // 无论成败都保证恢复到原来的挂起计数，否则服务器会卡死。
+//----------------------------------------------------------------------------------------
+// 线程是否"正在占用 CPU"
+//
+// 用 NtQueryInformationThread(ThreadBasicInformation=0) 取线程的 WaitReason：
+//   WaitReason == 0 (Executive)  -> 线程不在等待，即正在运行/可运行
+//   WaitReason != 0              -> 线程阻塞在某种等待上（WrUserRequest / WrQueue ...）
+//
+// 【为什么不直接用 WaitReason 之外的字段】实测踩过的坑：老办法（纯挂起取 IP）会把
+// 阻塞在 NtWaitForSingleObject / ZwWaitForMultipleObjects 里的空闲线程也算进来，
+// 它们的 IP 停在 ntdll 的 syscall 里，于是 ntdll 占比被抬到 90% 以上，报告失去意义。
+//
+// 结构用自定义 POD（不依赖 CLIENT_ID / KAFFINITY 这些在 winnt.h 里可用性不一的类型）。
+// 缓冲区开大一些，保证 WaitReason 落在其中；查询失败时保守返回 true（宁可多采不漏采）。
+//----------------------------------------------------------------------------------------
+struct PsThreadBasicInfo {
+    LONG exit_status;        // 0x00
+    void *teb;               // 0x04
+    void *unique_process;    // 0x08  (CLIENT_ID.UniqueProcess)
+    void *unique_thread;     // 0x0C  (CLIENT_ID.UniqueThread)
+    ULONG_PTR affinity;      // 0x10
+    LONG priority;           // 0x14
+    LONG base_priority;      // 0x18
+    ULONG pad;               // 0x1C (结构体按 8 字节对齐时的填充)
+    ULONG wait_reason;       // 0x20  THREAD_BASIC_INFORMATION 之后紧跟的字段
+};
+
+bool thread_is_running(HANDLE hThread) {
+    typedef LONG(WINAPI * NtQueryInformationThreadFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static NtQueryInformationThreadFn fn = 0;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) fn = (NtQueryInformationThreadFn)GetProcAddress(nt, "NtQueryInformationThread");
+    }
+    if (!fn) return true;  // 拿不到 API 就不过滤（保守）
+
+    // 开大缓冲区：ThreadBasicInformation(0) 会往这里写 THREAD_BASIC_INFORMATION，
+    // 后随的 wait_reason 也在同一块内存里
+    unsigned char buf[128];
+    memset(buf, 0, sizeof(buf));
+    ULONG ret = 0;
+    LONG st = fn(hThread, 0 /*ThreadBasicInformation*/, buf, (ULONG)sizeof(buf), &ret);
+    if (st != 0) return true;  // 查询失败：保守认为在运行
+
+    ULONG wait_reason = 0;
+    memcpy(&wait_reason, buf + 0x20, sizeof(wait_reason));
+    // 也和 0x1C 比较一下，取"看起来更合理"的那个（不同 Windows 版本填充不同）
+    ULONG alt = 0;
+    memcpy(&alt, buf + 0x1C, sizeof(alt));
+    if (wait_reason > 0x20 && alt <= 0x20) wait_reason = alt;
+
+    return wait_reason == 0;
+}
+
 static uintptr_t peek_thread_ip(DWORD tid) {
     uintptr_t ip = 0;
     HANDLE h = OpenThread(PERFSTAT_THREAD_ACCESS, FALSE, tid);
     if (!h) return 0;
+
+    // ★ 只采"正在占用 CPU"的线程 ★
+    // 阻塞在 WaitForSingleObject / WaitForMultipleObjects 等处的空闲线程，指令指针停在
+    // ntdll 的 syscall 里；把它们算进来会把 ntdll 的占比抬到 90% 以上，报告失去意义。
+    // 详见 thread_is_running 的说明。
+    if (g_state_filter && !thread_is_running(h)) {
+        CloseHandle(h);
+        return 0;
+    }
 
     DWORD prev = SuspendThread(h);
     if (prev == (DWORD)-1) {
@@ -743,6 +810,16 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 //----------------------------------------------------------------------------------------
 void ps_set_debug(int on) { InterlockedExchange((volatile LONG *)&g_ps_debug, on ? 1 : 0); }
 
+void ps_set_cpu_state_filter(int on) {
+    InterlockedExchange((volatile LONG *)&g_state_filter, on ? 1 : 0);
+}
+bool ps_get_cpu_state_filter(void) {
+    return InterlockedCompareExchange((volatile LONG *)&g_state_filter, 0, 0) != 0;
+}
+
+// Windows 不用信号采样，恒为 0（保持接口一致）
+long ps_handler_run_count(void) { return 0; }
+
 // 见 platform.h 的说明：给本模块 +1 引用计数，让引擎后续的 FreeLibrary 扣不掉我们，
 // 从而避免"卸载后引擎残留指针被访问 -> 崩溃"。
 // 用 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 从"本函数地址"反查模块句柄，
@@ -756,11 +833,6 @@ bool ps_keep_module_mapped() {
     return false;
 }
 
-// Windows 不用信号采样，恒为 0（保持接口一致）
-long ps_handler_run_count(void) { return 0; }
-
-// Windows 用 SuspendThread + GetThreadContext 取指令指针，不依赖信号，
-// 所以不需要"解开信号屏蔽"这一步。
 void ps_prepare_sampling_thread(void) {}
 
 void ps_request_stop_sampling(void) { stop_flag_set(1); }

@@ -119,6 +119,9 @@ static volatile int g_stop_sampling = 0;
 // 平台层自己的诊断开关。不要引用插件入口的全局变量（自检不编 core.cpp，会链接失败）。
 static volatile int g_ps_debug = 0;
 
+// "只采样运行态线程"开关，默认开（见 platform.h 的详细说明）
+static volatile int g_state_filter = 1;
+
 // 诊断计数器：用来区分"信号没送到"和"处理器跑了但没找到槽位"
 static volatile long g_handler_runs = 0;   // 处理器一共进了多少次
 static volatile long g_handler_miss = 0;   // 进了处理器但窗口内没有 state==1 的槽位
@@ -252,6 +255,43 @@ void ps_copy_cstr(char *dst, size_t cap, const char *src) {
     if (n > cap - 1) n = cap - 1;
     memcpy(dst, src, n);
     dst[n] = 0;
+}
+
+//----------------------------------------------------------------------------------------
+// 只保留"正在占用 CPU（运行态 R）"的线程
+//
+// 【为什么必须过滤】采样是"给线程投信号、取它当时的指令指针"。
+// 但一个阻塞在 futex/epoll/nanosleep 里的空闲线程，它的指令指针恰好停在
+// libc 的 syscall 包装里 —— 被采样到就会把这一票算给 libc/ntdll。
+// 服务器上大量工作线程平时都在阻塞等待，于是 libc/ntdll 的占比被抬到 90% 以上，
+// 而真正在跑的模块反而只有零点几个百分点，报告完全没有参考价值（实测如此）。
+//
+// 而 /proc/<tid>/stat 第 3 个字段就是线程状态：
+//   R = running/runnable（正在用或被调度用 CPU）
+//   S = 可中断睡眠（阻塞在 futex/nanosleep/read 等）
+//   D = 不可中断睡眠
+// 只采 R 才是"CPU 占用"的正确语义。
+//
+// 代价：每轮要读一遍 /proc/self/task/<tid>/stat。进程线程多时有点开销，
+// 但换来的是准确的结果，值得。开销统计见 perfstat.ini 的 cpu_state_filter 说明。
+//----------------------------------------------------------------------------------------
+bool thread_is_running(int tid) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;  // 线程刚退出
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return false;
+    buf[n] = 0;
+    // stat 的第 2 个字段是 (comm)，里面可能带空格和括号，所以从最后一个 ')' 之后开始
+    char *rp = strrchr(buf, ')');
+    if (!rp || rp[1] == 0) return false;
+    // 跳过 ') ' 之后就是 state 字段
+    char *p2 = rp + 1;
+    while (*p2 == ' ') p2++;
+    return *p2 == 'R';
 }
 
 std::vector<int> list_tids() {
@@ -781,6 +821,17 @@ int ps_sample_threads(uintptr_t *ips, uint32_t *out_tids, int max_ips) {
     static std::vector<int> tid_list;
     tid_list = list_tids();
 
+    if (g_state_filter) {
+        static std::vector<int> running;
+        running.clear();
+        running.reserve(tid_list.size());
+        for (size_t i = 0; i < tid_list.size(); ++i) {
+            if (thread_is_running(tid_list[i])) running.push_back(tid_list[i]);
+        }
+        if (running.empty()) return 0;
+        tid_list.swap(running);
+    }
+
     int n = (int)tid_list.size();
     if (n > max_ips) n = max_ips;
     return sample_tid_range(tid_list, 0, n, ips, out_tids, max_ips);
@@ -822,6 +873,19 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *out_tids, int max_ips, in
     }
     if (total <= 0) return 0;
     if (window <= 0 || window > max_ips) window = max_ips;
+
+    // ★ 只保留运行态线程（见 thread_is_running 的说明）★
+    // 这一步是让"CPU 占比"有意义的关键：否则阻塞线程会把 libc/ntdll 抬到 90%+。
+    if (g_state_filter) {
+        static std::vector<int> running;
+        running.clear();
+        running.reserve(tid_list.size());
+        for (size_t i = 0; i < tid_list.size(); ++i) {
+            if (thread_is_running(tid_list[i])) running.push_back(tid_list[i]);
+        }
+        if (running.empty()) return 0;  // 全都在睡：这一轮没有 CPU 占用可采
+        tid_list.swap(running);
+    }
 
     if (total <= window) {
         if (cursor) *cursor = 0;
@@ -925,6 +989,13 @@ const char *ps_symbolize(uintptr_t handle, uint32_t rva, uint32_t *offset) {
 }
 
 void ps_set_debug(int on) { __atomic_store_n(&g_ps_debug, on ? 1 : 0, __ATOMIC_RELEASE); }
+
+void ps_set_cpu_state_filter(int on) {
+    __atomic_store_n(&g_state_filter, on ? 1 : 0, __ATOMIC_RELEASE);
+}
+bool ps_get_cpu_state_filter(void) {
+    return __atomic_load_n(&g_state_filter, __ATOMIC_ACQUIRE) != 0;
+}
 
 // 见 platform.h 的说明。Linux 这边用 dlopen(自己) 把引用计数 +1，
 // 引擎随后的 dlclose 扣不掉，SO 就保持映射。需要 -ldl（已在链接参数里）。

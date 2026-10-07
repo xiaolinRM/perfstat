@@ -510,18 +510,25 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
     emit("--------------------------------------------------------------------------------\n");
 
     // ---- 表头 ----
-    emit(" #  CPU%%   MODULE                          MEM(MB)  mem排序   内存构成\n");
+    emit(" #  CPU%%   MODULE                          MEM(MB)  内存排名   内存构成\n");
     emit("--------------------------------------------------------------------------------\n");
 
     char namebuf[64];
+    int shown = 0;
     for (size_t i = 0; i < by_cpu.size(); ++i) {
         Snapshot::Row &r = *by_cpu[i];
         size_t mem_total = r.mem_mapped + r.mem_private + r.mem_other;
         if (r.hits == 0 && mem_total == 0) continue;  // 完全没数据的模块不显示
+        // 【下标必须用该行在 s.rows 里的真实下标】by_cpu 是按 CPU 排过序的指针数组，
+        // 用 (int)i 去索引 mem_rank 会取到"别的模块的名次"——之前就是这个 bug，
+        // 表现为 mem排序 列和 MEM 列对不上（例如 49MB 的行标成 #32）。
+        size_t row_idx = (size_t)(&r - &s.rows[0]);
+        if (row_idx >= mem_rank.size()) continue;  // 防御
         make_short(r.name, namebuf, 32);
         double pct = total > 0 ? (double)r.hits * 100.0 / (double)total : 0.0;
-        emit("%2d %5.2f  %-32s %8.2f  #%-4d map %.1f / priv %.1f / other %.1f\n", (int)i + 1, pct,
-             namebuf, (double)mem_total / (1024.0 * 1024.0), mem_rank[(int)i],
+        shown++;
+        emit("%2d %5.2f  %-32s %8.2f  #%-4d map %.1f / priv %.1f / other %.1f\n", shown, pct,
+             namebuf, (double)mem_total / (1024.0 * 1024.0), mem_rank[row_idx],
              (double)r.mem_mapped / (1024.0 * 1024.0), (double)r.mem_private / (1024.0 * 1024.0),
              (double)r.mem_other / (1024.0 * 1024.0));
     }
@@ -531,6 +538,8 @@ void Profiler::report(OutFn out, void *user, const Options &opt) {
          (double)total_mapped / (1024.0 * 1024.0), (double)total_private / (1024.0 * 1024.0),
          (double)total_other / (1024.0 * 1024.0),
          (double)(total_mapped + total_private + total_other) / (1024.0 * 1024.0));
+    emit(" MEM(MB)      : 该模块【驻留内存合计】= map + priv + other；\n");
+    emit(" 内存排名     : 上面这一列合计值在所有模块里的名次（#1 = 最占内存）\n");
     emit(" 内存列含义   : map=DLL/SO 文件本身占的驻留内存; priv=进程私有提交(堆/栈/运行时分配),\n");
     emit("                注意 priv 是【按地址区间归属】的估算, 引擎的全局分配器都在主程序名下。\n");
 

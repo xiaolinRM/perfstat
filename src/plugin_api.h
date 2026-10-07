@@ -225,6 +225,20 @@ public:
     virtual bool IsRegistered(void) const { return m_bRegistered; }
     virtual CVarDLLIdentifier_t GetDLLIdentifier() const { return 0; }
 
+    //----------------------------------------------------------------------------------------
+    // 【必须设置】注册成功后要把 m_bRegistered 置 true，反注册前置回 false。
+    //
+    // 这是 Source 注册流程的契约：IConCommandBaseAccessor::RegisterConCommandBase 在
+    // 真正注册成功后负责把它置位（引擎内部就是这么做的）。
+    //
+    // 漏掉它的后果（实测踩过）：引擎的 UnregisterConCommand 看到 IsRegistered()==false
+    // 就认为"这条命令没被注册过"，于是【静默不做任何事】—— 命令永远留在引擎的命令表里：
+    //   * 卸载后输入框仍有联想词、help xxx 仍能看到描述、也不报 Unknown command
+    //   * 再次 plugin_load 时每条指令都报
+    //     "WARNING: unable to link xxx and xxx because one or more is a ConCommand."
+    //----------------------------------------------------------------------------------------
+    void SetRegistered(bool state) { m_bRegistered = state; }
+
 protected:
     virtual void Create(const char *pName, const char *pHelpString = 0, int flags = 0) {
         m_pszName = pName;

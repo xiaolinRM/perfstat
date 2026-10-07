@@ -432,6 +432,51 @@ CPU% = 该模块命中采样数 / 总采样数
 
 ## 9. 常见问题
 
+**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），但输入没反应？**
+
+这是 v1.7.0 修掉的真 bug，根因是**注册时漏了置 `m_bRegistered` 标志**：
+
+Source 的注册流程里，`IConCommandBaseAccessor::RegisterConCommandBase` 在注册成功后
+**必须把 `m_bRegistered` 置为 true**。我们原来只调了 `ICvar::RegisterConCommand`，
+没置这个标志，于是 `IsRegistered()` 永远返回 false —— 而引擎的 `UnregisterConCommand`
+看到"没注册过"就**静默跳过、什么都不做**。结果：
+
+- 命令永远留在引擎命令表里 → 卸载后仍有联想词、`help xxx` 能看到描述、不报 Unknown command
+- 但命令对象的代码/字符串在已卸载的模块里 → 输入后没有反应（现在有 `keep_mapped` 所以不崩）
+- 再次 `plugin_load` 时每条指令都报
+  `WARNING: unable to link xxx and xxx because one or more is a ConCommand.`
+
+**修法**：注册成功后 `pVar->SetRegistered(true)`；反注册时**先**调用
+`UnregisterConCommand`（此时标志必须仍为 true，引擎才会真的处理），**再** `SetRegistered(false)`。
+
+自检里加了 3 条断言把回归挡住：假 ICvar 现在会模仿真实引擎"`IsRegistered()==false` 就跳过"
+的行为，并统计被跳过次数（必须为 0）。
+
+**Q：CPU 占比几乎全落在 `ntdll.dll` / `libc.so.6` 上（90%+），看不出别的模块谁高谁低？**
+
+这是 v1.7.0 修的另一个真 bug，而且**是统计口径的问题，不是显示精度的问题**。
+
+采样是"给线程投信号、取它当时的指令指针"。但**阻塞在 `futex` / `epoll` / `nanosleep`
+里的空闲线程**，指令指针恰好停在 libc/ntdll 的系统调用包装里 —— 被采样到就把票算给了
+系统库。服务器上大量工作线程平时都在阻塞等待，于是它们贡献了绝大多数样本。
+实测（VM 上 1 个忙线程 + 6 个空闲线程）：
+
+```
+A) 采样【全部】线程:      2100 样本   ← 空闲线程贡献了大量无意义样本
+                           而这些线程的真实 CPU 时间是 0 ms
+B) 只采样【R 状态】线程:  300 样本    ← 每轮正好 1 个（真在跑的那个）
+```
+
+**修法**：默认只采样"正在占用 CPU"的线程（`perfstat.ini` 的 `cpu_state_filter = 1`）：
+
+- Linux：`/proc/self/task/<tid>/stat` 第 3 字段 == `R`
+- Windows：`NtQueryInformationThread` 的 `WaitReason == 0`（不在等待）
+
+实测把归因率从 50% 提升到 98%（采到的样本几乎全是真在跑的线程）。
+
+> 注意：这么做之后，**如果服务器大部分时间都在空转，样本数会明显变少** ——
+> 这是对的，因为那段时间确实没有 CPU 占用可归因。想抓占用就去跑一段有负载的场景。
+
 **Q：`plugin_unload` 之后不崩，但在输入框里打任意一个字（不用回车）就崩溃？**
 
 这是 v1.4.2 修掉的真 bug，崩溃转储的特征很明确：

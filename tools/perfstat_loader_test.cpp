@@ -48,8 +48,9 @@ class FakeICvar : public ICvar {
 public:
     std::vector<ConCommandBase *> registered;
     int unregister_calls;
+    int unregister_skipped;  // 因 IsRegistered()==false 被引擎跳过几次
 
-    FakeICvar() : unregister_calls(0) {}
+    FakeICvar() : unregister_calls(0), unregister_skipped(0) {}
 
     virtual void *QueryInterface(const char *) { return 0; }
     virtual void *Connect(void *) { return 0; }
@@ -64,6 +65,12 @@ public:
     }
     virtual void UnregisterConCommand(ConCommandBase *p) {
         unregister_calls++;
+        // 【关键】真实引擎在这里会检查 IsRegistered()：没注册过的命令直接跳过不处理。
+        // 自检必须模仿这个行为，否则"插件忘了置 m_bRegistered"这种 bug 测不出来。
+        if (!p || !p->IsRegistered()) {
+            unregister_skipped++;
+            return;
+        }
         for (size_t i = 0; i < registered.size(); ++i) {
             if (registered[i] == p) {
                 registered.erase(registered.begin() + i);
@@ -336,7 +343,19 @@ int main(int argc, char **argv) {
     printf("\n--- 调用 Unload() ---\n");
     plugin->Unload();
     CHECK(g_fake_cvar.unregister_calls >= 10, "Unload() 把 10 个指令都反注册掉了（不会留下野指针）");
+    CHECK(g_fake_cvar.unregister_skipped == 0,
+          "反注册没有被引擎跳过（说明注册时正确置了 m_bRegistered）");
     CHECK(g_fake_cvar.registered.empty(), "反注册后 ICvar 里不再有我们的指令");
+
+    // 注册阶段就应该把 IsRegistered() 置位 —— 否则真实引擎会静默忽略反注册，
+    // 命令会永远留在引擎命令表里（表现为：卸载后仍有联想词/help 有描述/重载报 unable to link）
+    {
+        bool all_registered = true;
+        for (size_t i = 0; i < g_fake_cvar.registered.size(); ++i) {
+            if (!g_fake_cvar.registered[i]->IsRegistered()) all_registered = false;
+        }
+        CHECK(all_registered, "所有已注册指令的 IsRegistered() 都是 true");
+    }
 
     FreeLibrary(dll);
     CHECK(true, "FreeLibrary 成功卸载 DLL（采样线程已收干净）");

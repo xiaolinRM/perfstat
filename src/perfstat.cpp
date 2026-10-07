@@ -506,6 +506,7 @@ struct Config {
     int auto_dump_sec;  // 自动落盘周期（0=关闭）
     std::string auto_dump_path;
     bool keep_mapped;   // 卸载后是否刻意让本模块留在内存（默认 1，见下面说明）
+    bool cpu_state_filter;  // 只统计"正在占用 CPU"的线程（默认 1）
 
     Config()
         : sample_ms(10),
@@ -517,7 +518,8 @@ struct Config {
           show_threads(false),
           auto_start(true),
           auto_dump_sec(0),
-          keep_mapped(true) {}
+          keep_mapped(true),
+          cpu_state_filter(true) {}
 };
 
 Config g_config;
@@ -575,6 +577,8 @@ void load_config_file(const std::string &path) {
             g_config.auto_start = parse_bool(val, g_config.auto_start);
         else if (!strcasecmp(key, "keep_mapped"))
             g_config.keep_mapped = parse_bool(val, g_config.keep_mapped);
+        else if (!strcasecmp(key, "cpu_state_filter"))
+            g_config.cpu_state_filter = parse_bool(val, g_config.cpu_state_filter);
         else if (!strcasecmp(key, "auto_dump_sec"))
             g_config.auto_dump_sec = parse_int(val, g_config.auto_dump_sec);
         else if (!strcasecmp(key, "auto_dump_path"))
@@ -615,6 +619,9 @@ public:
     virtual bool RegisterConCommandBase(ConCommandBase *pVar) {
         if (!g_pCvar || !pVar) return false;
         g_pCvar->RegisterConCommand(pVar);
+        // 【必须】置位，否则引擎的 UnregisterConCommand 会因为 IsRegistered()==false
+        // 而静默跳过，命令就永远留在引擎命令表里（详见 plugin_api.h 里 SetRegistered 的说明）
+        pVar->SetRegistered(true);
         return true;
     }
 };
@@ -632,7 +639,11 @@ ConCommand *perf_register_command(const char *name, const char *help) {
     cmd->SetNext(g_cmd_head);
     g_cmd_head = cmd;
     g_cmd_count++;
-    if (g_pCvar) g_pCvar->RegisterConCommand(cmd);
+    if (g_pCvar) {
+        g_pCvar->RegisterConCommand(cmd);
+        // 同 accessor：注册成功后必须置位，否则反注册会被引擎静默忽略
+        cmd->SetRegistered(true);
+    }
     return cmd;
 }
 
@@ -659,8 +670,12 @@ void perf_unregister_commands() {
     vlog("unregister: begin (%d commands)", g_cmd_count);
     if (g_pCvar) {
         for (ConCommandBase *p = g_cmd_head; p; p = p->GetNext()) {
-            vlog("unregister: UnregisterConCommand('%s')", p->GetName() ? p->GetName() : "?");
+            // 顺序很重要：先反注册（此时 IsRegistered() 必须仍是 true，
+            // 否则引擎会认为"没注册过"而跳过），成功后再把标志清掉。
+            vlog("unregister: UnregisterConCommand('%s') registered=%d",
+                 p->GetName() ? p->GetName() : "?", (int)p->IsRegistered());
             g_pCvar->UnregisterConCommand(p);
+            p->SetRegistered(false);
         }
     }
     vlog("unregister: UnregisterConCommand done");
@@ -707,6 +722,8 @@ bool PerfStatPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn)
     g_vlog_t0 = ps::ps_now_seconds();
     vlog("Load: begin");
     ps_platform_init();
+    // 应用"只统计运行态线程"设置（默认开；这是让 CPU 占比有意义的关键，详见 platform.h）
+    ps_set_cpu_state_filter(g_config.cpu_state_filter ? 1 : 0);
     vlog("Load: platform init done");
     g_profiler = new Profiler();
     g_profiler->set_sample_interval_ms(g_config.sample_ms);
