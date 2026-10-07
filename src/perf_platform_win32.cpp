@@ -386,6 +386,25 @@ void ps_platform_shutdown() {
         free(g_ws_info);
         g_ws_info = 0;
     }
+
+    //----------------------------------------------------------------------------------------
+    // 【必须复位 g_inited】—— 这里曾经是一个确定的 bug，症状非常隐蔽
+    //
+    // ps_platform_init() 开头是 `if (g_inited) return true;`。卸载时上面把 g_ws_info
+    // free 掉了，但如果 g_inited 不复位，重新加载时 init 会直接早退 —— 于是
+    // g_ws_info 就一直是 NULL，而平台层却处于"已初始化"状态。
+    //
+    // 后果：ps_walk_memory 里 `g_ws_info[k].VirtualAddress = ...` 往空/野指针写，
+    // 每次都在同一个地址触发【写】访问违例，而且只在 unload->reload 之后出现：
+    //     [perfstat] 异常诊断: code=0xC0000005 addr=... 阶段='collect_memory'
+    // 首次加载完全正常（内存归因要等第一次 report 才走，那时 g_ws_info 是好的），
+    // 所以只在热重载场景暴露。
+    //
+    // 修法：shutdown 把状态清干净，让下一次 init 真正重新初始化一遍。
+    //----------------------------------------------------------------------------------------
+    g_process = 0;
+    g_QueryWorkingSetEx = 0;
+    g_inited = false;
 }
 
 //----------------------------------------------------------------------------------------
@@ -707,6 +726,7 @@ int ps_sample_threads_window(uintptr_t *ips, uint32_t *tids, int max_ips, int *c
 //----------------------------------------------------------------------------------------
 // 内存归因
 //----------------------------------------------------------------------------------------
+// 阶段标记（定义在 core.cpp，本文件已在 ps 命名空间内），定位内存遍历崩在哪一步
 void ps_walk_memory(ModuleLookupFn lookup, void *user, ModuleInfo *mods, int mod_count) {
     if (!g_inited) ps_platform_init();
     if (!g_process || !mods || mod_count <= 0) return;
