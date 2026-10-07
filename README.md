@@ -14,10 +14,41 @@ left4dead2/addons/
 
 - **不依赖 metamod**、**不依赖 sourcemod**
 - **不需要 hl2sdk 就能编译**（自带一份与官方 SDK 逐字对齐的最小 ABI 头文件）
-- 运行期只调用操作系统 API 与 libc，**不链接 tier0 / tier1 / vstdlib**
+- **不链接** tier0 / tier1 / vstdlib：只用到操作系统 API 与 libc。
+  唯一例外是运行期按需 `GetProcAddress` / `dlsym` 取 `tier0!ConMsg` 用于输出
+  （见 [4. 输出在哪里看](#4-输出在哪里看先看这段能省掉最常见的困惑)）——
+  是可选依赖，拿不到就自动降级到别的输出通道。
 
 功能：按**动态链接库（DLL / SO）**统计服务器进程内部的 CPU 占用与内存占用，从大到小排序，
 并可以展开看每个模块内部的**热点函数 / 偏移**，以及**线程维度**明细。
+
+**输出长这样**（真实 L4D2 专用服务器的实测报告，节选）：
+
+```
+ perfstat  服务器性能分析报告
+--------------------------------------------------------------------------------
+ 采样间隔     : 10 ms     采样次数: 42426     采样漏掉/无效: 0
+ 统计时长     : 75.1 秒   实际采样频率: 564.8 次/秒
+ 模块数量     : 159       线程数量: 104
+--------------------------------------------------------------------------------
+ #  CPU%   MODULE                          MEM(MB)  内存排名   内存构成
+--------------------------------------------------------------------------------
+ 1 26.73  ntdll.dll                            1.64  #13   map 1.0 / priv 0.0 / other 0.7
+ 2 19.80  KERNELBASE.dll                       2.23  #11   map 0.5 / priv 0.0 / other 1.7
+ 3 16.83  server.dll                           9.31  #2    map 6.2 / priv 0.0 / other 3.1
+ 4  9.90  studiorender.dll                     4.32  #6    map 0.3 / priv 0.0 / other 4.1
+ 5  7.92  engine.dll                           7.23  #3    map 4.6 / priv 0.0 / other 2.7
+ 6  7.92  tier0.dll                            0.48  #34   map 0.4 / priv 0.0 / other 0.0
+ 7  7.92  dedicated.dll                        1.12  #17   map 0.6 / priv 0.0 / other 0.5
+```
+
+> **CPU% 是"按线程真实 CPU 时间加权"的比例**，不是简单的采样计数。
+> 这一点很关键：服务器上大量工作线程平时阻塞在系统调用里，如果等权计数，
+> `ntdll` / `libc` 会被抬到 90%+ 而真正干活的模块只剩 0.0x%，报告就没有参考价值了。
+> 详见 [FAQ](#10-常见问题) 里那条 ntdll 占 98% 的说明。
+
+**已实测环境**：Windows 专用服 + Linux 专用服（L4D2）。完整验证矩阵见
+[11.7 验证状态](#117-验证状态当前版本实测到哪一步)。
 
 ---
 
@@ -26,16 +57,17 @@ left4dead2/addons/
 - [1. 它到底能测出什么（先看这段）](#1-它到底能测出什么先看这段)
 - [2. 编译](#2-编译)
 - [3. 安装与加载](#3-安装与加载)
-- [4. 控制台指令](#4-控制台指令)
-- [5. 怎么读报告](#5-怎么读报告)
-- [6. 配置 perfstat.ini](#6-配置-perfstatini)
-- [7. 原理](#7-原理)
-- [8. 开销与风险（重要）](#8-开销与风险重要)
-- [9. 常见问题](#9-常见问题)
-- [10. 自检工具（不用开服就能验证）](#10-自检工具不用开服就能验证)
-- [11. GitHub Actions 自动编译](#11-github-actions-自动编译)
-- [12. 文件结构](#12-文件结构)
-- [13. 可以继续加的功能](#13-可以继续加的功能)
+- [4. 输出在哪里看（**先看这段**）](#4-输出在哪里看先看这段能省掉最常见的困惑)
+- [5. 控制台指令](#5-控制台指令)
+- [6. 怎么读报告](#6-怎么读报告)
+- [7. 配置 perfstat.ini](#7-配置-perfstatini)
+- [8. 原理](#8-原理)
+- [9. 开销与风险（重要）](#9-开销与风险重要)
+- [10. 常见问题](#10-常见问题)
+- [11. 自检工具（不用开服就能验证）](#11-自检工具不用开服就能验证)
+- [12. GitHub Actions 自动编译](#12-github-actions-自动编译)
+- [13. 文件结构](#13-文件结构)
+- [14. 可以继续加的功能](#14-可以继续加的功能)
 
 ---
 
@@ -93,32 +125,60 @@ sudo apt install g++-multilib
 make            # 产物：Release/perfstat.so
 ```
 
-> ℹ️ **Linux 由 GitHub Actions 验证，不是我在本机编的。**
-> 交付环境只有 Windows + MSVC，我没有 Linux 工具链，所以 Linux 的编译与自检放在
-> [工作流](#11-github-actions-自动编译)里跑：它会 `g++ -m32` 编出 `.so`、用 `file`/`nm`
-> 校验产物、再跑一遍 POSIX 加载自检（dlopen + 假 ICvar + 真实采样）。
-> 如果 Actions 报错，把失败那一步的日志发我即可。
+> ⚠️ **`Makefile` 里的 `-static-libstdc++ -static-libgcc` 不能去掉。**
+> 服务端自带一份**较老的** `bin/libstdc++.so.6`。如果在较新发行版上编（例如
+> Ubuntu 22.04 / gcc 11）而不静态链接 C++ 运行库，插件在服务端会加载失败：
+>
+> ```
+> failed to dlopen .../perfstat.so error=bin/libstdc++.so.6:
+>   version `GLIBCXX_3.4.29' not found
+> ```
+>
+> 静态链接后产物不依赖服务端的 C++ 运行库版本，**在任何发行版上编出来都能直接跑**。
+> 验证方法（期望输出 `0`）：
+>
+> ```bash
+> objdump -T Release/perfstat.so | grep -c GLIBCXX
+> ```
+>
+> 自己手写编译命令的话，务必带上这两个 flag。
+
+> ℹ️ **Linux 由 GitHub Actions 与一台 Ubuntu 22.04 虚拟机双份验证**
+> （本机验证流程见 [11.8 本地 Linux 验证环境](#118-本地-linux-验证环境重要不要只靠-ci-猜)）。
+> [工作流](#12-github-actions-自动编译)里会 `g++ -m32` 编出 `.so`、用 `file` / `nm`
+> 校验产物、再跑一遍 POSIX 加载自检（`dlopen` + 假 ICvar + 真实采样）。
+> 如果 Actions 报错，把失败那一步的日志发出来即可。
 
 ### 上传到 GitHub 之前要做什么
 
 **直接推整个 `perfstat` 文件夹就行，不需要手动删东西**：`.gitignore` 已经把
 `build/`、`Release/`、`dist/`、`*.log`、`*.obj`、`*.dll`、`*.so` 之类全部忽略掉了。
 
-仓库里应该只有这些（20 个文件）：
+仓库里应该只有这些（24 个文件）：
 
 ```
-.github/workflows/build.yml      GitHub Actions 工作流
+.github/workflows/build.yml            GitHub Actions 工作流
 .gitignore
-build_win32.bat                  Windows 构建脚本
-Makefile                         Linux 构建脚本
-perfstat.ini                     配置示例
+build_win32.bat                        Windows 构建脚本
+Makefile                               Linux 构建脚本（已静态链接 libstdc++）
+perfstat.ini                           配置示例
+perfstat.vdf                           自动加载配置（放 addons/ 用）
 README.md
-src/*.h  src/*.cpp               源码（8 个）+ perfstat.def（说明用，当前不需要）
-tools/*.bat  tools/Makefile.linux_tests
-tools/perfstat_tests.cpp         算法/ABI 自检
-tools/perfstat_loader_test.cpp   Windows 加载自检
-tools/perfstat_loader_test_linux.cpp   Linux 加载自检
-tools/perfstat_smoke_linux.cpp   Linux 平台层冒烟测试
+src/perfstat.cpp  src/perfstat.h       插件入口 / 指令 / 配置
+src/core.cpp      src/core.h           profiler：采样循环、报告、排序
+src/perf_platform_win32.cpp            Windows 平台层（挂起线程取 IP、内存遍历）
+src/perf_platform_linux.cpp            Linux 平台层（信号采样、/proc 解析）
+src/platform.h                         平台层接口
+src/plugin_api.h                       自带的最小 ABI 头（与官方 SDK 逐字对齐）
+src/compat.h                           MSVC / GCC 兼容层
+src/perfstat.def                       导出表说明（当前用 __declspec(dllexport)，不需要）
+tools/build_tests.bat                  构建算法自检
+tools/build_loader_test.bat            构建 Windows 加载自检
+tools/Makefile.linux_tests             构建两个 Linux 自检
+tools/perfstat_tests.cpp               算法 / ABI 自检（36 项）
+tools/perfstat_loader_test.cpp         Windows 加载自检（21 项）
+tools/perfstat_loader_test_linux.cpp   Linux 加载自检（38 项）
+tools/perfstat_smoke_linux.cpp         Linux 平台层冒烟测试（12 项）
 ```
 
 > 如果你已经推过一次、发现仓库里有 `build/` 之类的残留，用这两条清掉：
@@ -184,7 +244,7 @@ left4dead2/
 ```
 plugin_load addons/perfstat      :: 对；和 vdf 里的 "file" 写法一样
 plugin_load perfstat             :: 错；这样会报 Unable to load plugin
-perf_print                       :: 确认插件列表里有 perfstat（老版本引擎是 plugin_print）
+plugin_print                    :: 确认插件列表里有 perfstat（引擎自带指令）
 perf_help
 ```
 
@@ -197,11 +257,49 @@ perf_help
 
 > **卸载注意**：`plugin_unload` 之后插件会**刻意保留控制台命令对象的内存**（不 free）。
 > 这是有意为之，不是泄漏 bug —— 因为引擎侧的 ConCommandBase 链表可能仍持有这些对象，
-> 一旦 free 掉，下次在输入框里**打任意一个字**（触发补全）就会崩溃。详见第 9 节 FAQ。
+> 一旦 free 掉，下次在输入框里**打任意一个字**（触发补全）就会崩溃。详见
+> [10. 常见问题](#10-常见问题)。
 
 ---
 
-## 4. 控制台指令
+## 4. 输出在哪里看（**先看这段，能省掉最常见的困惑**）
+
+> ⚠️ **L4D2 专用服务器上，`ICvar::ConsolePrintf` 是不可靠的。**
+> 它调用成功、返回值正常，但文字**既不上服务器控制台、也不进 `console.log`** ——
+> 插件看起来"完全没反应"。这是引擎的行为，不是插件故障
+> （本地 listen server 上它是正常的，所以我们最初也测不出来）。
+>
+> **v1.14.0 起改为优先用 `tier0!ConMsg`**（引擎自己打印控制台就是用它），
+> 另有一份**独立输出文件**兜底，所以现在输出一定看得到。
+
+**三个地方可以看输出，任选：**
+
+| 位置 | 说明 |
+| --- | --- |
+| **服务器控制台** | 正常应该能看到（走 `ConMsg`） |
+| `left4dead2/addons/perfstat-out.log` | **插件自己的输出文件**，所有指令输出都追加在这里。控制台看不到时看这个 |
+| 服务端根目录 `perfstat-时间戳.log` | `perf_dump` 与自动落盘生成的**完整报告** |
+
+`perf_selftest` 会明确告诉你当前用的是哪条输出通道，以及落盘是否可用：
+
+```
+ 输出通道      : tier0!ConMsg   (1=ICvar::ConsolePrintf 2=tier0!ConMsg 3=stdout)
+```
+
+启动横幅里也会直接写明输出文件的完整路径：
+
+```
+ perfstat v1.16.0 已加载（纯引擎插件，不依赖 metamod / sourcemod）
+ 输出: 提示若控制台不显示，请看 /home/xiaolin/27015/left4dead2/addons/perfstat-out.log
+ 配置: 已读取 /home/xiaolin/27015/left4dead2/addons/perfstat.ini
+```
+
+> 提示：想在控制台看到输出，建议给服务端加 `-condebug`，这样引擎会把控制台内容
+> 同时写进 `left4dead2/console.log`，方便事后查看。
+
+---
+
+## 5. 控制台指令
 
 | 指令 | 作用 |
 | --- | --- |
@@ -230,7 +328,7 @@ perf_dump               :: 存档一份，方便对比
 
 ---
 
-## 5. 怎么读报告
+## 6. 怎么读报告
 
 ```
 ================================================================================
@@ -306,34 +404,69 @@ CPU% = 该模块命中采样数 / 总采样数
 
 ---
 
-## 6. 配置 `perfstat.ini`
+## 7. 配置 `perfstat.ini`
 
-把 [`perfstat.ini`](perfstat.ini) 放到下面任一位置即可：
+把 [`perfstat.ini`](perfstat.ini) 放到下面任一位置即可（**按顺序查找，命中第一个就用它**）：
 
-1. 服务器工作目录下的 `perfstat.ini`
-2. srcds 可执行文件同目录
-3. `<srcds目录>/cfg/perfstat.ini`
+1. **`addons/perfstat.ini`** —— 即**插件自己所在的目录**，⭐ **推荐放这里**
+2. `addons/cfg/perfstat.ini`
+3. 服务器根目录（工作目录）下的 `perfstat.ini`
+4. srcds 可执行文件同目录（兜底）
 
-改完执行 `perf_load` 立刻生效。所有键都可省略。
+> v1.15.0 起改为 **`addons/` 优先**。原因：更早的版本用"服务端进程所在目录"来找配置，
+> 而 Linux 上那是**游戏根目录**而不是 `addons/` —— 导致放在 `addons/` 里的配置永远读不到。
+> 现在按"插件自身路径"查找（见
+> [FAQ](#10-常见问题)），启动横幅会打印实际读到的是哪一份：
+>
+> ```
+>  配置: 已读取 /home/xiaolin/27015/left4dead2/addons/perfstat.ini
+> ```
+>
+> 没有这一行就说明一份都没读到（此时全部用默认值）。
+
+改完执行 `perf_load` 立刻生效（**不需要重启、也不需要重载插件**）。所有键都可省略。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `sample_ms` | 10 | 采样间隔（毫秒），越小越精细、开销越大 |
+| `sample_ms` | 10 | 采样间隔（毫秒），越小越精细、开销越大。建议 5 ~ 50 |
 | `duration_sec` | 0 | 默认采样时长，0 = 不自动停 |
 | `console_top` | 25 | `perf_stat` 打印多少行 |
 | `hotspot_top` | 8 | 每个模块展开几个热点 |
 | `hotspot_min_hits` | 2 | 热点显示门槛（过滤噪声） |
-| `show_hotspot` | 0 | `perf_stat` 是否也展开热点 |
+| `show_hotspot` | 0 | `perf_stat` 是否也展开热点（=1 等价于 `perf_top`） |
 | `show_threads` | 0 | 是否附带线程明细 |
 | `auto_start` | 1 | 加载后自动开始采样 |
-| `auto_dump_sec` | 0 | 每隔多少秒自动落盘一份报告 |
-| `auto_dump_path` | 空 | 固定落盘路径（配合 `duration_sec`） |
+| `auto_dump_sec` | 0 | 每隔多少秒自动落盘一份报告（长期观察用） |
+| `auto_dump_path` | 空 | 固定落盘路径；留空 = 自动命名 |
+| `keep_mapped` | 1 | 卸载后刻意让模块留在内存里（**强烈建议保持 1**，见 [9. 卸载与热重载](#卸载与热重载plugin_unload--plugin_load)） |
+| `cpu_state_filter` | 1 | 只统计"运行态"线程（**强烈建议保持 1**，见下面说明） |
+
+### 两个"强烈建议保持 1"的键
+
+**`cpu_state_filter`（决定 CPU 占比有没有意义）**
+
+采样是"给线程投信号、取它当时的指令指针"。但阻塞在 `futex` / `epoll` / `nanosleep` 里的
+空闲线程，指令指针恰好停在 `libc`（Linux）/ `ntdll`（Windows）的系统调用包装里 ——
+被采到就把这一票算给了系统库。服务器上大量工作线程平时都在阻塞等待，于是系统库占比
+被抬到 90% 以上，真正在跑的模块只剩零点几个百分点（实测症状）。
+
+打开后只采样"运行态"线程：
+
+- Linux：`/proc/self/task/<tid>/stat` 第 3 字段 == `'R'`
+- Windows：`NtQueryInformationThread` 的 `WaitReason == 0`（不在等待）
+
+**`keep_mapped`（决定卸载后会不会崩）**
+
+保持 1 时，卸载后插件会给自己 +1 模块引用计数，引擎扣不掉它，模块一直是"有效但不再使用"
+的内存。代价是**DLL/SO 文件会被占用、无法删除/替换**（重启服务端即可）。
+设 0 才是真正卸载。详见
+[FAQ：卸载后 dll 被占用](#10-常见问题)。
 
 ---
 
-## 7. 原理
+## 8. 原理
 
-### 7.1 CPU：逐线程挂起取指令指针
+### 8.1 CPU：逐线程挂起取指令指针
 
 ```
 采样线程（插件创建，优先级略低）
@@ -359,12 +492,12 @@ CPU% = 该模块命中采样数 / 总采样数
 > **滑动窗口**：线程很多的服务器（几百个线程）如果一轮全挂起来，单次停顿会变长。
 > 所以一轮最多实际挂起 `24` 个线程，其余线程在后续轮次轮转覆盖——统计上仍然是均匀的。
 
-### 7.2 地址归因
+### 8.2 地址归因
 
 按模块基址升序建表，采样到的 IP 用**二分查找**找"最后一个基址 ≤ IP 的模块"，
 再检查 `IP < base + size`。落在模块之外的采样（JIT 代码、已卸载模块）不参与百分比。
 
-### 7.3 符号解析
+### 8.3 符号解析
 
 不用 dbghelp、不用 libbfd，直接读文件：
 
@@ -375,7 +508,7 @@ CPU% = 该模块命中采样数 / 总采样数
   收 `STT_FUNC` / `STT_OBJECT` 且 `st_shndx != SHN_UNDEF` 的符号，
   `st_value` 减去 ELF 头里 PT_LOAD 的最低 `p_vaddr` 得到模块内偏移。
 
-### 7.4 内存归因
+### 8.4 内存归因
 
 - **Windows**：`VirtualQueryEx` 遍历整个虚拟地址空间 → `GetMappedFileName` 拿到
   该区域映射的是哪个文件（`\Device\HarddiskVolumeX\...` 会用 `QueryDosDevice` 建的前缀表
@@ -386,7 +519,7 @@ CPU% = 该模块命中采样数 / 总采样数
 > ⚠️ **所有文件 API 都用宽字符版本**。中文路径（例如 `G:\工作区\...`）用
 > `CreateFileA` 会直接返回 `ERROR_PATH_NOT_FOUND`。这是开发时真实踩过的坑。
 
-### 7.5 为什么不抓调用栈
+### 8.5 为什么不抓调用栈
 
 抓完整调用栈需要栈展开（unwind），32 位 + 优化过的二进制 + 在别人线程的栈上走，
 很容易读坏内存直接崩服。所以这里只取"当前指令指针"这一层：
@@ -394,7 +527,7 @@ CPU% = 该模块命中采样数 / 总采样数
 
 ---
 
-## 8. 开销与风险（重要）
+## 9. 开销与风险（重要）
 
 ### 性能开销
 
@@ -417,22 +550,41 @@ CPU% = 该模块命中采样数 / 总采样数
 3. **只统计加载之后的行为**：`plugin_load` 之前的模块加载、初始化开销看不到。
 4. **模块热更**：采样期间新加载的 DLL 会在下一轮报告里出现；已卸载模块的历史采样会变成"无归属"。
 
-### 卸载（`plugin_unload`）
+### 卸载与热重载（`plugin_unload` / `plugin_load`）
 
-`Unload()` 会按顺序做三件事：
+`Unload()` 会按顺序做这些事：
 
-1. 停掉采样线程并 **`WaitForSingleObject` / `pthread_join` 等它真正退出**
+1. 请求采样线程停止，并 **`WaitForSingleObject` / `pthread_join` 等它真正退出**
    —— 否则线程会跑在已卸载的代码上，直接崩服；
-2. 把所有 `perf_*` 指令从 `ICvar` **反注册**并释放；
-3. 关闭符号表、释放缓存。
+2. 把所有 `perf_*` 指令从 `ICvar` **反注册**，并**用 `FindCommandBase()` 回查确认**；
+3. 删除 profiler 实例、复位平台层状态（**这一步漏了就会在重新加载后崩，见下**）；
+4. 关闭符号表、释放缓存；
+5. 给自己 +1 模块引用计数（仅当 `keep_mapped = 1`）—— 见
+   [FAQ：卸载后 dll 被占用](#10-常见问题)。
 
-所以 `plugin_load` / `plugin_unload` 可以反复执行。
+**热重载是可用的**，可以反复 `plugin_unload` / `plugin_load`：
+
+| 操作 | 结果 |
+| --- | --- |
+| `plugin_unload` | 命令变回 Unknown command、无联想词、DLL 可自由操作 |
+| 重新 `plugin_load` | 采样与报告立即恢复，无告警、无崩溃 |
+
+> **v1.16.0 修掉了一个"只在热重载时暴露"的崩溃**，根因是平台层
+> `ps_platform_shutdown()` **没有复位 `g_inited`**：而 `ps_platform_init()` 开头是
+> `if (g_inited) return true;`，于是重新加载时 init 直接早退，`g_ws_info`（工作集查询缓冲）
+> 保持为已经 `free` 过的状态 —— 内存归因往野指针写，每次都崩在同一个地址。
+> 首次加载完全正常（内存归因要等第一次报告才走，那时缓冲是好的），所以这个 bug
+> 只在 unload→reload 场景出现，而且症状非常像"引擎的问题"。
+> 详见 [10. 常见问题](#10-常见问题) 里那条热重载崩溃。
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
-**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），但输入没反应？**
+**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），但输入没反应？（原因一：注册标志没置）**
+
+> ⚠️ 这个症状有**两个独立原因**，都真实发生过。这里是**原因一**（注册标志）；
+> **原因二**是"命令链被引擎覆盖"，见下面标题带"原因二"的那条。
 
 这是 v1.7.0 修掉的真 bug，根因是**注册时漏了置 `m_bRegistered` 标志**：
 
@@ -504,11 +656,13 @@ fwrite(...); fclose(f);           // ← 就永远执行不到！
 通知引擎清理引用"的机制**，所以插件侧只能靠"别让模块真被卸掉"来自保。
 
 想要能删文件，把 `perfstat.ini` 里的 `keep_mapped` 设成 `0`（会真正卸载）。
-但请先确认命令注销是干净的 —— 见下一个问题。
+但请先确认命令注销是干净的 —— 见下面两条带"原因一 / 原因二"的 FAQ。
 
-**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），输入没反应？**
+**Q：卸载后 `perf_*` 指令还在（有联想词、`help perf_stat` 有描述、不报 Unknown command），输入没反应？（原因二：命令链被引擎覆盖）**
 
-根因是**我们用 `m_pNext` 维护了自己的命令链表，而那是引擎的字段**：
+这是**同一个症状的第二个原因**，修完原因一之后才暴露出来的：
+
+**根因**是我们用 `m_pNext` 维护了自己的命令链表，而**那是引擎的字段**。
 
 `ICvar::RegisterConCommand` 会用 `ConCommandBase::m_pNext` 把命令挂进**引擎自己的全局
 命令链表**，因此会**覆盖**我们注册前 `SetNext()` 串的那条链。结果卸载时
@@ -524,8 +678,62 @@ fwrite(...); fclose(f);           // ← 就永远执行不到！
 `m_pNext`。同时反注册后立刻用 `ICvar::FindCommandBase()` 回查一遍，确认引擎里真的
 找不到了才算成功（日志里会打印"全部 N 条命令都已从引擎命令表移除"）。
 
-> 另有一个更早的坑：注册成功后必须置 `m_bRegistered`（见下面那条 FAQ），
+> 另有一个更早的坑：注册成功后必须置 `m_bRegistered`（见上面"原因一"那条），
 > 否则引擎的 `UnregisterConCommand` 会因为 `IsRegistered()==false` 而静默跳过。
+
+**Q：`plugin_unload` 之后再 `plugin_load`，一执行 `perf_stat` / `perf_top` 就报"生成报告时发生访问违例"，而且控制台还时不时重复刷这条？**
+
+这是 **v1.16.0 修掉的真 bug**，而且是个非常经典的"初始化 / 清理不对称"错误。诊断输出长这样：
+
+```
+[perfstat] 异常诊断: code=0xC0000005 addr=... 阶段='collect_memory'
+[perfstat] 警告: 执行控制台指令时发生访问违例（已捕获，未崩溃）。
+```
+
+**根因**：平台层的初始化标志没有在卸载时复位。
+
+```cpp
+bool ps_platform_init() {
+    if (g_inited) return true;     // ← 第二次 load 时直接早退
+    g_inited = true;
+    ...
+    g_ws_info = malloc(...);        // ← 从此再也不会执行
+}
+
+void ps_platform_shutdown() {
+    free(g_ws_info);
+    g_ws_info = 0;                  // ← 第一次 unload 时把它 free 了
+    // ❌ 但 g_inited 没有复位！
+}
+```
+
+于是第二次 `Load()` 时状态自相矛盾：
+
+| | `g_ws_info` | `g_inited` | 结果 |
+| --- | --- | --- | --- |
+| 首次加载 | `malloc` 成功 | true | ✅ 正常 |
+| unload 后 | **被 free → NULL** | **仍是 true** | ⚠️ 矛盾 |
+| 重新加载 | **没有重新分配** | init 早退 | 💥 野指针 |
+
+`ps_walk_memory` 里 `g_ws_info[k].VirtualAddress = ...` **往空/野指针写** → 写访问违例。
+
+**为什么它特别像"引擎的问题"**（我们一开始也误判了）：
+
+1. **只在 unload→reload 之后出现** —— 看起来像引擎卸载没清干净；
+2. **首次加载完全正常** —— 内存归因只在**第一次报告**才走，那时缓冲还是好的，所以首次加载永远测不出来；
+3. **`addr` 每次都是同一个值** —— 是 `malloc` 拿到的固定堆块地址，稳定得像引擎里的某个固定结构；
+4. 症状是"`perf_stat` 没反应 + `perf_dump` 说访问违例 + 日志文件被占用"，全是一个 bug 的连带现象。
+
+**修法**：shutdown 把状态清干净，让下一次 init 真正重新初始化（Windows 与 Linux 两侧都有这个隐患，都已修）：
+
+```cpp
+g_process = 0;
+g_QueryWorkingSetEx = 0;
+g_inited = false;   // ← 关键
+```
+
+> 这类"init/shutdown 成对"的状态，**最容易漏的就是那个早退标志**。写插件时值得专门检查一遍：
+> 凡是 `shutdown` 释放过的资源，它的 `init` 必须能再跑一次。
 
 **Q：CPU 占比几乎全落在 `ntdll.dll` / `libc.so.6` 上（90%+），看不出别的模块谁高谁低？**
 
@@ -631,7 +839,7 @@ unmapped 掉了**：此后引擎侧任何指向我们内存的指针（命令对
 - 是 32 位产物（`dumpbin /headers perfstat.dll` 看 `machine (x86)`）
 - Linux 上产物名必须是 **`perfstat.so`**（`.vdf` 写的是基名 `addons/perfstat`，
   引擎自己拼 `.so`；写成 `perfstat_srv.so` 之类会找不到）
-- 日常其实**不需要**这条指令 —— 放好 `.vdf` 后开服会自动加载，用 `perf_print` 确认即可
+- 日常其实**不需要**这条指令 —— 放好 `.vdf` 后开服会自动加载，用 `plugin_print` 确认即可
 
 **Q：加载成功但 `perf_stat` 报 `Unknown command`？**
 说明指令没注册上（拿不到 `VEngineCvar007`）。看加载时的输出有没有
@@ -639,16 +847,93 @@ unmapped 掉了**：此后引擎侧任何指向我们内存的指针（命令对
 但需要用别的方式触发报告（例如 `auto_dump_sec` 自动落盘）。
 
 **Q：指令能联想、不报 Unknown command，但控制台什么文字都没有？**
-这是 v1.0 的一个已知问题，已经在 v1.0.1 修掉：早期版本用 C 运行时的 `printf` 输出，
-而本地 listen server 里进程的 `stdout` 并不接到游戏控制台（只有服务器控制台窗口/日志能看到）。
-现在改成按优先级走引擎自己的输出通道：
 
-1. `ICvar::ConsolePrintf`（首选，服务器控制台注册的显示函数会把它带给玩家）
-2. `tier0!ConMsg`（次选，走引擎 spew 输出）
+**有两种情况，先分清是哪种：**
+
+**情况 A：输出通道不对（v1.14.0 修）。** 这是**L4D2 专用服务器上最常见**的困惑。
+
+`ICvar::ConsolePrintf` 在专用服务器上**调用成功、返回值正常，但文字既不上服务器控制台、
+也不进 `console.log`** —— 插件看起来完全没反应。（本地 listen server 上它是正常的，
+所以最初在 listen server 上开发时测不出来。另一位使用者反馈"改用 `tier0!ConMsg` 就正常了"，
+与本项目实测一致。）
+
+v1.14.0 起优先级改为：
+
+1. **`tier0!ConMsg`（首选）** —— 引擎自己打印控制台就是用它，Windows / Linux 都可靠
+2. `ICvar::ConsolePrintf`（次选，listen server 上有效）
 3. `fputs(stdout)`（兜底，纯命令行 srcds 或重定向到文件时有用）
 
-执行 `perf_selftest` 会明确告诉你当前用的是哪一条通道。如果那里显示的是
-`stdout (兜底)`，说明前两条都不可用，把结果发我。
+**情况 B：引擎控制台本身就不显示插件输出。** 即使走对了通道，某些服务器配置下控制台
+仍可能看不到。所以插件从 v1.14.0 起**把所有指令输出同时写进自己的文件**：
+
+```
+left4dead2/addons/perfstat-out.log
+```
+
+启动横幅里会直接写明这个文件的完整路径，`perf_selftest` 也会报告当前通道：
+
+```
+ 输出通道      : tier0!ConMsg   (1=ICvar::ConsolePrintf 2=tier0!ConMsg 3=stdout)
+```
+
+**结论：不管控制台显示与否，`perfstat-out.log` 一定能看到完整输出。**
+如果那里显示 `stdout (兜底)`，说明前两条都不可用，把 `perf_selftest` 的输出发我。
+
+**Q：Linux 上 `Unable to load plugin "addons/perfstat"`，日志里写着 `GLIBCXX_3.4.29' not found`？**
+
+完整报错长这样：
+
+```
+failed to dlopen .../addons/perfstat.so error=bin/libstdc++.so.6:
+  version `GLIBCXX_3.4.29' not found (required by .../addons/perfstat.so)
+Unable to load plugin "addons/perfstat"
+```
+
+**根因**：服务端自带了一份 `bin/libstdc++.so.6`（版本通常比较老），而你在较新的发行版上
+（例如 Ubuntu 22.04 / gcc 11）编译，产物需要的符号版本比它新。**跟插件代码无关。**
+
+**修法（仓库里的 Makefile 已经这么做了**）：把 C++ 运行库**静态链进去**：
+
+```make
+LDFLAGS = -m32 -shared -rdynamic -static-libgcc -static-libstdc++
+```
+
+这样插件就不依赖服务端的 C++ 运行库版本，**在任何发行版上编出来都能直接跑**
+（代价是 `.so` 稍大一点，完全值得）。
+
+验证是否已静态链接（应输出 0 或没有输出）：
+
+```bash
+objdump -T Release/perfstat.so | grep -c GLIBCXX     # 期望：0
+```
+
+> 如果你是**自己手写的编译命令**（没用仓库的 Makefile），务必加上
+> `-static-libstdc++ -static-libgcc`，否则很容易踩这个坑。
+
+**Q：Linux 上 `perfstat.ini` 明明放在 `addons/` 里，插件却说读不到？**
+
+这是 v1.15.0 修掉的真 bug。原来查找配置用 `exe_dir()`，而它的含义是"**服务端进程**所在
+目录"—— Linux 上是游戏根目录（`/proc/self/exe` → `srcds_linux`），**不是 `addons/`**。
+所以插件跑去根目录找 `perfstat.ini`，`addons/` 里那份永远读不到。
+
+**修法**：新增 `module_dir()` —— 用**插件自身的路径**
+（Linux `dladdr()`、Windows `GetModuleHandleExW(FROM_ADDRESS)`），这才是
+"和插件放在一起"的真正含义。
+
+配置查找顺序（v1.15.0 起）：
+
+1. `<插件目录>/perfstat.ini` ← 即 `addons/perfstat.ini`，**推荐放这里**
+2. `<插件目录>/cfg/perfstat.ini`
+3. 服务器根目录 `perfstat.ini`（兼容旧用法）
+4. `exe_dir()/perfstat.ini`（兜底）
+
+启动横幅会明确打印实际读到的是哪一份：
+
+```
+ 配置: 已读取 /home/xiaolin/27015/left4dead2/addons/perfstat.ini
+```
+
+如果**没有**这一行，说明一份都没读到（就会全用默认值）。
 
 **Q：Linux 上采不到样本 / 执行 `perf_*` 卡住 / 卸载时段错误？**
 这几个问题都真实出现过（v1.0.2 ~ v1.0.6 陆续修掉），根因都在 Linux 的信号采样上：
@@ -830,12 +1115,12 @@ v1.0.3 修掉了一个真实的顺序 bug：`report()` 里原本是"**先取快�
 
 ---
 
-## 10. 自检工具（不用开服就能验证）
+## 11. 自检工具（不用开服就能验证）
 
 `tools/` 下有两个自检程序，用来验证"插件能不能被引擎加载"和"采样归因算得对不对"。
 它们**不需要 srcds**，直接在本机跑。
 
-### 10.1 算法自检 `perfstat_tests.exe`
+### 11.1 算法自检 `perfstat_tests.exe`
 
 ```bat
 tools\build_tests.bat
@@ -852,7 +1137,7 @@ build\perfstat_tests.exe
 - **端到端采样**：真起两个线程（一个空转烧 CPU、一个睡觉），采 3 秒，
   确认样本落在正确的模块和函数上，并打印一份真实报告。
 
-### 10.2 加载自检 `perfstat_loader_test.exe`
+### 11.2 加载自检 `perfstat_loader_test.exe`
 
 ```bat
 tools\build_loader_test.bat
@@ -878,7 +1163,7 @@ build\perfstat_loader_test.exe
 > 不要用 `findstr` 去匹配日志里的中文（"失败 0 项"）——`findstr` 对 UTF-8 中文的匹配
 > 不可靠，测试全过也会被判失败（这个坑踩过一次）。
 
-### 10.3 Linux 平台层冒烟测试 `perfstat_smoke_linux`
+### 11.3 Linux 平台层冒烟测试 `perfstat_smoke_linux`
 
 ```bash
 make -f tools/Makefile.linux_tests smoke
@@ -890,7 +1175,7 @@ make -f tools/Makefile.linux_tests smoke
 "插件加载流程有没有问题"分开定位。它带一个 `SIGALRM` 看门狗：超时就把当前卡在哪个阶段
 写到 stderr 再退出，不会让 CI 一直挂着。
 
-### 10.4 Linux 自检 `perfstat_loader_test_linux`
+### 11.4 Linux 自检 `perfstat_loader_test_linux`
 
 ```bash
 make -f tools/Makefile.linux_tests
@@ -908,7 +1193,7 @@ make -f tools/Makefile.linux_tests
    验证信号采样通路和模块归因真的能工作
 6. `Unload()` 反注册全部指令，`dlclose()` 成功（说明采样线程收干净了）
 
-### 10.5 两个自检的分工（重要）
+### 11.5 两个自检的分工（重要）
 
 这两个程序验证的东西**刻意分开**，因为它们的"进程里平台层副本数量"不同：
 
@@ -926,7 +1211,7 @@ make -f tools/Makefile.linux_tests
 所以：**平台层的确定性验证放 smoke test（单副本）；loader test 只观察插件自己的
 profiler 样本数有没有增长**。真实服务器里插件只有一份副本，不存在这个冲突。
 
-### 10.6 自检自身的两个结构坑（都踩过）
+### 11.6 自检自身的两个结构坑（都踩过）
 
 写自检时踩的，记录一下免得重复：
 
@@ -952,21 +1237,51 @@ profiler 样本数有没有增长**。真实服务器里插件只有一份副本
 这两条加上前面那条"loader test 不要自己采样"，本质是同一件事：
 **先把测试环境搭对，再去测被测对象。**
 
-### 10.7 还没验证的部分
+### 11.7 验证状态（当前版本实测到哪一步）
 
-- **在真实 srcds 里加载**：本机没有 L4D2 服务端，无法实测。
-  能离线验证的部分（导出符号、ABI、加载流程、指令注册与派发、采样算法、
-  Linux 的编译与运行）都由自检和 CI 覆盖了；真机上剩下的不确定点主要是
-  "引擎传进来的 `interfaceFactory` 能否取到 `VEngineCvar007`" 这类加载时机差异。
-- **Windows 上 listen server 的控制台表现**：输出通道已经改成 `ICvar::ConsolePrintf`，
-  但最终效果要你在真机上确认一次（见下面的 FAQ）。
+**已在真实的 L4D2 专用服务器上完整验证过**（Windows + Linux 各一台）：
 
-反馈方式：加载插件后执行一次 `perf_selftest`，
-把控制台内容发回来，我按实际情况调。
+| 验证项 | Windows 专用服 | Linux 专用服 |
+| --- | --- | --- |
+| `.vdf` 自动加载 | ✅ | ✅ |
+| 控制台输出（`ConMsg`） | ✅ 进 `console.log` | ✅ 进 `console.log` |
+| 读取 `addons/perfstat.ini` | ✅ | ✅ |
+| 采样持续增长 | ✅ 564.8 次/秒 | ✅ |
+| 内存归因（模块 / 内存两列） | ✅ | ✅ |
+| `perf_stat` / `perf_top` / `perf_threads` | ✅ | ✅ |
+| `perf_dump` 落盘 | ✅ | ✅ |
+| `auto_dump_sec` 定时自动落盘 | ✅ | ✅ |
+| `plugin_unload` 命令注销 | ✅ | ✅ |
+| **`plugin_unload` → `plugin_load` 热重载** | ✅ 两轮零异常 | ✅ 两轮零异常 |
+| 卸载后 DLL/SO 可自由操作 | ✅ | ✅ |
+
+**离线自检**（不需要开服，随时可跑）：
+
+| 工具 | 平台 | 结果 |
+| --- | --- | --- |
+| `perfstat_tests` | Windows | 36 项全过 |
+| `perfstat_loader_test` | Windows | 21 项全过 |
+| `perfstat_smoke_linux` | Linux | 12/12 |
+| `perfstat_loader_test_linux` | Linux | 38 项全过 |
+
+**还没验证的部分**：
+
+- **只在 L4D2 上测过**。接口（`ISERVERPLUGINCALLBACKS003` / `VEngineCvar007`）是
+  Source 引擎通用的，理论上 CSS / TF2 / CSGO 等同类 srcds 也能用，但**没有实测**。
+  欢迎反馈 —— 主要不确定点是 `.vdf` 的加载时机和 `IServerPluginCallbacks` 的版本号。
+- **其他架构**：只做了 32 位（`-m32`）。srcds 本身是 32 位的，所以这是对的；
+  但 64 位服务端（例如某些新版引擎）没测。
+- **长时间（数小时）连续采样的稳定性**：目前最长连续跑了 80 秒级的验证。
+  采样是统计抽样，长期开着理论上没有累积性风险（无内存增长、采样线程不做分配），
+  但没做过小时级压测。
+
+**反馈方式**：出问题时先执行一次 `perf_selftest`，把它的输出（或
+`addons/perfstat-out.log`）发出来 —— 那里有输出通道、采样状态、模块/线程数、
+落盘是否可用等关键信息。
 
 ---
 
-### 10.8 本地 Linux 验证环境（重要：不要只靠 CI 猜）
+### 11.8 本地 Linux 验证环境（重要：不要只靠 CI 猜）
 
 **教训**：修 Linux 采样问题时，曾经连续多轮"改代码 → 推 CI → 等人把日志转过来"，
 效率极低，而且很容易误判 —— 日志里 stdout 是块缓冲（进程退出才刷）、stderr 无缓冲，
@@ -1012,7 +1327,7 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 >    2 核机器上会因调度偶发失败。CI 里两者是独立 step，验证时也应在各自独立进程里跑。
 > 2. `grep -c FAIL` 会把诊断摘要里的 `失败=0` 数进去，别用它判成败 —— 看退出码。
 
-## 11. GitHub Actions 自动编译
+## 12. GitHub Actions 自动编译
 
 仓库里已经带好了工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)。
 把整个 `perfstat` 文件夹推到 GitHub，然后在 **Actions** 页面就能看到：
@@ -1027,7 +1342,7 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-### 11.2 下载到的产物是什么结构
+### 12.1 下载到的产物是什么结构
 
 **三个 artifact 现在都是"直接上传文件夹"** —— GitHub 会自动把它打成 zip，所以用户
 下载解压后**直接看到文件夹，中间不再有任何多余的 zip 层**：
@@ -1060,9 +1375,11 @@ perfstat-all-platforms.zip  (artifact)
 > 2. `download-artifact` 会为每个 artifact 名建子目录（`artifacts/perfstat-windows/...`），
 >    构建脚本里已按这个约定处理。
 
-| `perfstat-windows.zip` | `addons/perfstat.dll`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、两个自检 exe 与日志 |
-| `perfstat-linux.zip` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
-| `perfstat-all-platforms.zip` | 上面两个合并成一个总包（一次下载搞定） |
+| artifact 名（GitHub 上显示） | 内容 |
+| --- | --- |
+| `perfstat-windows` | `addons/perfstat.dll`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、自检 exe 与日志 |
+| `perfstat-linux` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
+| `perfstat-all-platforms` | 上面两个合并成的总包（一次下载搞定） |
 
 工作流做了这些事：
 
@@ -1081,19 +1398,20 @@ perfstat-all-platforms.zip  (artifact)
 
 ---
 
-## 12. 文件结构
+## 13. 文件结构
 
 ```
 perfstat/
 ├── build_win32.bat                  Windows 32 位构建脚本
 ├── Makefile                         Linux 32 位构建脚本
-├── perfstat.ini                     可选配置（放服务器目录）
+├── perfstat.ini                     可选配置（放服务器的 addons/ 下）
+├── perfstat.vdf                     自动加载配置（放服务器的 addons/ 下）
 ├── .gitignore
 ├── .github/workflows/build.yml      GitHub Actions：双平台自动编译 + 自检 + 打包
 ├── src/
 │   ├── plugin_api.h                 自带的引擎 ABI 头文件（逐字对齐官方 SDK）
 │   ├── perfstat.h                   插件类声明 + 编译期 ABI 断言
-│   ├── perfstat.cpp                 入口：22 个回调、指令注册与派发、日志落盘
+│   ├── perfstat.cpp                 入口：20 个引擎回调、指令注册与派发、报告落盘
 │   ├── core.h / core.cpp            与平台无关：模块表、采样归因、热点统计、报告生成
 │   ├── platform.h                   平台抽象层接口
 │   ├── perf_platform_win32.cpp      Windows：Toolhelp/挂起采样、PE 导出表、VirtualQuery
@@ -1125,11 +1443,11 @@ perfstat.cpp (插件入口 / 指令)
 
 ---
 
-## 13. 可以继续加的功能
+## 14. 可以继续加的功能
 
 按"性价比"排序，想做哪个告诉我：
 
-1. **`perfstat.ini` 之外的真 ConVar**（`perf_sample_ms` 等），可以用 `cvar` 指令直接改
+1. **把配置项注册成真正的 ConVar**（例如 `perf_sample_ms`），这样就可以用 `cvar` 指令直接改、也能被 `cfg` 文件统一管理。目前配置只走 `perfstat.ini` + `perf_load`
 2. **CSV 输出**，方便在 Excel 里画趋势图
 3. **定时对比**：把两次采样的差值算出来，专门看"这段时间里谁涨得最快"
 4. **调用栈采样**（`-fno-omit-frame-pointer` 的模块上做帧指针回溯），能给出"谁调用了谁"
