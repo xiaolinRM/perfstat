@@ -1078,6 +1078,12 @@ unsigned long long ps_thread_cpu_time_ns(uint32_t tid) {
 }
 
 void ps_prepare_sampling_thread(void) {
+    // 【必须清除"请求停止"标志】它由 ps_request_stop_sampling() 在 Unload 时置 1，
+    // 而 SO 因为 keep_mapped 留在内存里、静态变量不会重置。重新 load 时新的采样线程
+    // 一进循环就看到它还是 1，立刻退出 —— 表现为"正在采样 / 已采样本: 0 / 0.0 次/秒"，
+    // perf_stat、perf_top 永远没数据（实测踩过）。
+    __atomic_store_n(&g_stop_sampling, 0, __ATOMIC_RELEASE);
+
     if (!g_inited) ps_platform_init();
     if (g_sig < 0) return;
     // 创建采样线程的那个线程可能屏蔽了采样信号（掩码会被继承），这里把它解开，

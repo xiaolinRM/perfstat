@@ -389,24 +389,21 @@ jobs:
             echo "::error::缺 linux 插件"; exit 1; }
           test -f bundle/perfstat-linux/addons/perfstat.vdf || {
             echo "::error::缺 linux vdf"; exit 1; }
-          # 从 bundle 内部打包，zip 里顶层就是那两个目录（不多一层、不套 zip）
-          cd bundle && zip -r ../perfstat-all-platforms.zip . && cd ..
-          echo "--- 汇总包条目 ---"
-          unzip -l perfstat-all-platforms.zip | head -30
-          ls -l perfstat-all-platforms.zip
+          # 【不打 zip，直接交给 GitHub】
+          #
+          # GitHub 的 artifact 本身就是 zip：只要上传【一个文件夹】，用户下载解压后
+          # 直接就是那个文件夹，不会出现"zip 里还有 zip"。
+          # 之前我们自己先 zip 一遍再上传，就变成了"artifact.zip -> 我们的.zip -> 目录"，
+          # 也就是"解压后还是同名 zip"的来源。
+          echo "=== bundle 结构（将作为文件夹直接上传）==="
+          find bundle | sort
 
-      # 【artifact 名字故意和里面的 zip 不同名】
-      #
-      # 这是关键：GitHub 会把 artifact 打成"以 artifact 名命名的 zip"。
-      # 之前 artifact 叫 perfstat-all-platforms，里面装的 zip 也叫
-      # perfstat-all-platforms.zip —— 用户解压后看到的就是"一个同名 zip"，
-      # 看起来像"重复打包"（其实那个 zip 内部结构是正确的，只有两个平台目录）。
-      #
-      # 改名后两者不同，一眼能分清：
-      #   下载的 perfstat-bundle.zip -> perfstat-all-platforms.zip -> 两个平台目录
+      # 【上传文件夹本身，不打包】
+      # GitHub 会自动把 artifact 打成 zip；用户下载解压后直接看到 perfstat-windows/
+      # 和 perfstat-linux/ 两个目录，中间不再有任何多余的 zip 层。
       - name: 上传总包
         uses: actions/upload-artifact@v4
         with:
-          name: perfstat-bundle
-          path: perfstat-all-platforms.zip
+          name: perfstat-all-platforms
+          path: bundle
           if-no-files-found: error

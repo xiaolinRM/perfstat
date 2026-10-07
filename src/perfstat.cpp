@@ -607,6 +607,24 @@ std::string config_path() {
 // 没注册过的名字会直接报 "Unknown command"，插件的 ClientCommand 根本收不到。
 // 引擎里这件事本来是 ConVar_Register() 干的，插件没有 tier1，所以这里自己实现
 // 一个最小访问器，把注册动作转给 ICvar::RegisterConCommand。
+// ---------------------------------------------------------------------------------------
+// 前置声明：ps_cmd_dispatch 用得到（它在下面、早于 namespace ps 的定义处）
+// ---------------------------------------------------------------------------------------
+namespace ps {
+class Profiler;
+extern Profiler *g_profiler;
+class PerfStatPlugin;
+extern PerfStatPlugin g_perfstat;
+}
+
+static int ps_seh_filter(unsigned int code) {
+    if (code == 0xC0000005 /*ACCESS_VIOLATION*/ || code == 0xC000001D /*ILLEGAL_INSTRUCTION*/ ||
+        code == 0xC0000094 /*INT_DIVIDE_BY_ZERO*/ || code == 0xC00000FD /*STACK_OVERFLOW*/) {
+        return 1;  // EXCEPTION_EXECUTE_HANDLER
+    }
+    return 0;  // EXCEPTION_CONTINUE_SEARCH：别的异常交回给引擎
+}
+
 //----------------------------------------------------------------------------------------
 // （g_pCvar 已在文件上方提前声明，输出通道也要用它）
 
@@ -637,45 +655,32 @@ public:
 // g_profiler 的真实定义在下面的 namespace ps 里（因为 ClientCommand 在 ps 内），
 // 这里只做声明。
 // ---------------------------------------------------------------------------------------
-namespace ps {
+void ps_call_report_to_string(void *prof, void *sink, const void *opt, int *ok) {
+#if defined(_MSC_VER)
+    __try {
+        ((ps::Profiler *)prof)->report(capture_out, sink, *(const ps::Profiler::Options *)opt);
+        *ok = 1;
+    } __except (ps_seh_filter(GetExceptionCode())) {
+        *ok = 0;
+    }
+#else
+    ((ps::Profiler *)prof)->report(capture_out, sink, *(const ps::Profiler::Options *)opt);
+    *ok = 1;
+#endif
+}
 
-// g_profiler 的唯一定义（上面的 ps_cmd_dispatch 通过前置声明使用它）
-Profiler *g_profiler = 0;
-class Profiler;
-extern Profiler *g_profiler;
-class PerfStatPlugin;
-extern PerfStatPlugin g_perfstat;
+// 把真正的调用隔离出来（同样是为了规避 C2712：ps_cmd_dispatch 里有 __try）
+static void ps_seh_guarded_dispatch(const CCommand &cmd) {
+    ps::g_perfstat.ClientCommand(0, cmd);
 }
 
 #if defined(_MSC_VER)
-//----------------------------------------------------------------------------------------
-// 结构化异常保护（SEH）
-//
-// 【为什么需要】实测：unload 之后再 load，执行 perf_stat / perf_top / perf_selftest 会崩，
-// 崩溃指令在 perfstat.dll 内部（读地址 0x02，典型的空指针/坏指针解引用）。
-// 这个崩溃发生在"引擎里还留着上一代命令对象"这种边界状态上。
-//
-// 该问题的根因定位需要反复试错，但【让游戏不崩】是可以立刻做到的：
-// 用 SEH 把命令执行整个包起来，任何访问违例都被捕获、打印一行诊断、然后正常返回 ——
-// 玩家/服务器不会因为"分析插件"而崩溃，同时日志里留下了确切的故障地址供继续排查。
-//
-// 注意：SEH 只能保证"我们自己的回调不把进程带崩"，不能修好底层的内存问题；
-// 但配合"命令对象复用池"（见 perf_register_command），边界状态已经被大幅收窄。
-//----------------------------------------------------------------------------------------
-static int ps_seh_filter(unsigned int code) {
-    if (code == 0xC0000005 /*ACCESS_VIOLATION*/ || code == 0xC000001D /*ILLEGAL_INSTRUCTION*/ ||
-        code == 0xC0000094 /*INT_DIVIDE_BY_ZERO*/ || code == 0xC00000FD /*STACK_OVERFLOW*/) {
-        return 1;  // EXCEPTION_EXECUTE_HANDLER
-    }
-    return 0;  // EXCEPTION_CONTINUE_SEARCH：别的异常交回给引擎
-}
-
 static void ps_cmd_dispatch(const CCommand &cmd) {
     if (!ps::g_profiler) return;  // 卸载后 / 重载中：忽略这次调用
     __try {
-        ps::g_perfstat.ClientCommand(0, cmd);
+        ps_seh_guarded_dispatch(cmd);
     } __except (ps_seh_filter(GetExceptionCode())) {
-        // 把故障地址打出来，方便继续定位（同时保证不崩）
+        // 访问违例被捕获，保证不把游戏带崩；同时打印诊断方便继续定位
         fprintf(stderr,
                 "[perfstat] 警告: 执行控制台指令时发生访问违例（已捕获，未崩溃）。"
                 "这通常是 unload 后重新 load 的边界状态导致的，建议重新开服以保证状态干净。\n");
@@ -683,9 +688,10 @@ static void ps_cmd_dispatch(const CCommand &cmd) {
     }
 }
 #else
+// Linux 没有 SEH；posix 下信号采样的访问违例会直接终止进程，这里只做空指针防护
 static void ps_cmd_dispatch(const CCommand &cmd) {
-    if (!ps::g_profiler) return;  // 卸载后 / 重载中：忽略这次调用
-    ps::g_perfstat.ClientCommand(0, cmd);
+    if (!ps::g_profiler) return;
+    ps_seh_guarded_dispatch(cmd);
 }
 #endif
 
@@ -843,6 +849,9 @@ void ps_register_console_commands() {
 // 插件
 //----------------------------------------------------------------------------------------
 namespace ps {
+// g_profiler 的唯一定义（上面的 ps_cmd_dispatch 通过前置声明使用它）
+Profiler *g_profiler = 0;
+
 PerfStatPlugin g_perfstat;
 
 PerfStatPlugin::PerfStatPlugin()
@@ -996,14 +1005,18 @@ bool PerfStatPlugin::write_report_file(const std::string &explicit_path, std::st
         path = join_path(resolve_log_dir(), "perfstat-" + timestamp_name() + ".log");
     }
 
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) {
-        char buf[600];
-        snprintf(buf, sizeof(buf), "[perfstat] 无法写入日志文件: %s\n", path.c_str());
-        console_out(buf);
-        return false;
-    }
-
+    //----------------------------------------------------------------------------------------
+    // 【先生成内容，最后才开文件】
+    //
+    // 为什么顺序很重要：原来是 fopen -> report(...) -> fwrite -> fclose。
+    // 如果 report() 中途出错（访问违例被 ps_cmd_dispatch 的 SEH 捕获），
+    // 执行流会直接跳到异常处理器，后面的 fwrite/fclose 永远执行不到 —— 结果是
+    // 【日志文件被创建了、内容是空的、而且句柄一直开着】，表现为文件被
+    // left4dead2.exe 占用、无法删除（实测踩过）。
+    //
+    // 改成"先把报告生成到内存字符串，全部成功后再一次性写盘"，就不会再出现
+    // "建了空文件还占着" 的情况：要么写成功，要么根本不创建文件。
+    //----------------------------------------------------------------------------------------
     CaptureOut cap;
     cap.sink = new std::string();
     cap.to_console = false;
@@ -1014,10 +1027,27 @@ bool PerfStatPlugin::write_report_file(const std::string &explicit_path, std::st
     opt.no_memory = false;
     opt.min_hits = g_config.min_hits;
     opt.title = 0;
-    g_profiler->report(capture_out, &cap, opt);
 
-    fwrite(cap.sink->data(), 1, cap.sink->size(), f);
-    fclose(f);
+    int ok = 0;
+    ps_call_report_to_string(g_profiler, &cap, &opt, &ok);
+    if (!ok) {
+        delete cap.sink;
+        console_out("[perfstat] 生成报告时发生访问违例（已跳过本次落盘）\n");
+        return false;  // 注意：此时【还没有创建文件】，不会留下被占用的空文件
+    }
+
+    {
+        FILE *f = fopen(path.c_str(), "wb");
+        if (!f) {
+            delete cap.sink;
+            char buf[600];
+            snprintf(buf, sizeof(buf), "[perfstat] 无法写入日志文件: %s\n", path.c_str());
+            console_out(buf);
+            return false;
+        }
+        if (!cap.sink->empty()) fwrite(cap.sink->data(), 1, cap.sink->size(), f);
+        fclose(f);  // 这里一定会执行到（上面没有可能抛出的调用）
+    }
     delete cap.sink;
 
     out_path = path;

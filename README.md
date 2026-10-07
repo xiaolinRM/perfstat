@@ -452,6 +452,46 @@ Source 的注册流程里，`IConCommandBaseAccessor::RegisterConCommandBase` �
 自检里加了 3 条断言把回归挡住：假 ICvar 现在会模仿真实引擎"`IsRegistered()==false` 就跳过"
 的行为，并统计被跳过次数（必须为 0）。
 
+**Q：卸载后重新加载，`perf_stat` / `perf_top` 没有任何反应，`perf_selftest` 显示"已采样本: 0"？**
+
+v1.12.0 修掉的真 bug，根因是**平台层的"请求停止采样"标志没有在重新加载时清除**：
+
+`ps_request_stop_sampling()` 在 `Unload()` 时把 `g_stop_sampling` 置为 1。而插件因为
+`keep_mapped` 会留在内存里，**静态变量不会重置**。于是重新 `Load()` 时，新的采样线程
+一进循环就看到这个标志还是 1，`while (m_running && !ps_stop_requested())` 立刻为假
+—— 线程马上退出，一个样本都采不到：
+
+```
+采样状态      : 正在采样      <- 状态看着是对的
+已采样本      : 0            <- 但一个样本都没有
+实际采样频率  : 0.0 次/秒
+```
+
+`perf_stat` / `perf_top` 因此永远没有数据可显示（看起来就是"没反应"）。
+
+**修法**：采样线程启动时（`ps_prepare_sampling_thread()`）**把该标志清零**。
+这个函数本来就是"采样线程启动后第一件事要调用的"，之前用来解开信号掩码，
+现在同时负责重置停止标志。
+
+**Q：`perf_dump` / `perf_selftest` 之后，日志文件被创建了但内容是空的，而且一直被游戏进程占用？**
+
+v1.12.0 修掉的真 bug。原来的顺序是：
+
+```cpp
+FILE *f = fopen(path, "wb");     // 先把文件建出来
+g_profiler->report(...);          // ← 如果这里出错（访问违例）
+fwrite(...); fclose(f);           // ← 就永远执行不到！
+```
+
+访问违例被 SEH 捕获后，执行流直接跳到异常处理器，**后面的 `fclose` 被跳过** ——
+于是文件已创建、内容为空、句柄一直开着，表现为"文件被 `left4dead2.exe` 占用，删不掉"。
+
+**修法**：改成"**先把报告生成到内存字符串，全部成功后再一次性写盘**"。
+这样要么写成功、要么根本不创建文件，不会再出现"建了空文件还占着"。
+
+> 实现细节：MSVC 不允许在含 C++ 对象（需要展开）的函数里使用 `__try`（error C2712），
+> 所以把"调用 `report()`"这一步隔离到一个不含 C++ 对象的小函数里，SEH 才放得下。
+
 **Q：`plugin_unload` 之后，资源管理器显示这个 dll 被占用，无法替换/删除？**
 
 **这是 `keep_mapped = 1`（默认）的必然结果，不是 bug。** 插件在 `Unload()` 结尾
@@ -987,31 +1027,32 @@ make -f tools/Makefile.linux_tests    # 两个自检 -> build/
 
 | 产物 | 内容 |
 | --- | --- |
-### 11.2 下载到的产物是什么结构（重要，别被"套了两层"绕晕）
+### 11.2 下载到的产物是什么结构
 
-**先说结论：GitHub Actions 的 artifact 本身就是一个 zip，这是它的机制，插件作者改不了。**
-所以"下载 → 解压 → 再解压"这个体感是正常的。三个 artifact 的真实结构：
+**三个 artifact 现在都是"直接上传文件夹"** —— GitHub 会自动把它打成 zip，所以用户
+下载解压后**直接看到文件夹，中间不再有任何多余的 zip 层**：
 
 ```
-perfstat-windows.zip        (artifact)
-└── addons/{perfstat.dll, perfstat.vdf, perfstat.ini}
-    tests/
-    README.md
-        ← 解压一次就到位，里面没有任何 zip
+perfstat-windows.zip   (artifact)
+└── perfstat-windows/
+    ├── addons/{perfstat.dll, perfstat.vdf, perfstat.ini}
+    ├── tests/
+    └── README.md
 
-perfstat-linux.zip          (artifact)  同上，addons/perfstat.so
+perfstat-linux.zip     (artifact)
+└── perfstat-linux/
+    ├── addons/{perfstat.so, perfstat.vdf, perfstat.ini}
+    ├── tests/
+    └── README.md
 
-perfstat-bundle.zip         (artifact)
-└── perfstat-all-platforms.zip           ← 这里面才是总包
-    ├── perfstat-windows/{addons,tests,README.md}
-    └── perfstat-linux/{addons,tests,README.md}
+perfstat-all-platforms.zip  (artifact)
+├── perfstat-windows/{addons,tests,README.md}
+└── perfstat-linux/{addons,tests,README.md}
 ```
 
-**只有总包会看到两层**，因为总包本身就是一个 zip 文件，而承载它的 artifact 又必须是 zip。
-为了让这个"两层"不再看着像 bug，**artifact 名（`perfstat-bundle`）和里面的 zip 名
-（`perfstat-all-platforms.zip`）故意取成不同名** —— 否则会出现
-"下载 perfstat-all-platforms.zip，解压出来还是 perfstat-all-platforms.zip"这种纯属命名
-造成的错觉（用户反馈过，其实内部结构一直是对的）。
+**关键点：我们自己不再打任何 zip**。GitHub 的 artifact 本身就是 zip，直接上传文件夹
+即可；如果我们先 zip 一遍再上传，就会变成"artifact.zip → 我们的.zip → 目录"，
+也就是"解压后还是同名 zip"的来源（用户反馈过多次）。
 
 > **历史坑（都已修）**：
 > 1. 早期把"打好包的 zip"当 artifact 内容上传 → 真的要解两次才见到文件。现在两个平台的

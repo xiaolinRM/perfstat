@@ -895,7 +895,18 @@ unsigned long long ps_thread_cpu_time_ns(uint32_t tid) {
     return ns;
 }
 
-void ps_prepare_sampling_thread(void) {}
+//----------------------------------------------------------------------------------------
+// 采样线程启动时调用（每次 load 都会走一遍）
+//
+// 【必须在这里清除 g_stop_sampling】它是"请求立刻停止采样"的标志，由
+// ps_request_stop_sampling() 在 Unload 时置 1 —— 而本模块因为 keep_mapped 会留在内存里，
+// 静态变量不会重置。于是重新 load 时，新的采样线程一进循环就看到这个标志还是 1，
+// 立刻退出：表现为"采样状态: 正在采样 / 已采样本: 0 / 实际采样频率: 0.0 次/秒"，
+// perf_stat、perf_top 也就永远没有数据（实测踩过）。
+//
+// Windows 侧本来不需要做信号相关准备，这个清理就是它存在的唯一理由。
+//----------------------------------------------------------------------------------------
+void ps_prepare_sampling_thread(void) { stop_flag_set(0); }
 
 void ps_request_stop_sampling(void) { stop_flag_set(1); }
 
