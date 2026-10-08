@@ -196,24 +196,52 @@ jobs:
   # ======================================================================================
   # Linux：编 32 位 perfstat.so，跑 POSIX 加载自检，打包上传
   # ======================================================================================
+  # Linux：在【老 glibc 容器】里编 32 位 perfstat.so
+  #
+  # 【为什么必须用容器】这是踩过的真坑：
+  #   GitHub 的 ubuntu-latest 现在是 Ubuntu 24.04（glibc 2.39）。gcc 会把"编译机上
+  #   可见的符号版本"写进产物，于是编出来的 .so 要求 GLIBC_2.36 —— 而 Ubuntu 22.04
+  #   只有 glibc 2.35，用户那边直接加载失败：
+  #       version `GLIBC_2.36' not found
+  #
+  #   glibc 是【向后兼容】的：在老系统上编出来的产物，能在新系统上跑；反过来不行。
+  #   所以在老 glibc 容器里编译，是产出"到处都能跑"的 Linux 二进制的标准作法。
+  #   （注意 -static-libstdc++ 只解决 libstdc++，解决不了 glibc —— 这是两件事。）
+  #
+  #   选 ubuntu:20.04 = glibc 2.31：比 CentOS 7(2.17) / Ubuntu 18.04(2.27) 新一点点，
+  #   但比 Ubuntu 22.04(2.35) 低，实测覆盖足够；而且软件源还在正常提供服务。
+  # ======================================================================================
   linux:
     name: Linux (i386 / g++)
     runs-on: ubuntu-latest
+    container: ubuntu:20.04
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 同一段脚本要在两种环境里都能跑：
+      #   * 在容器里（ubuntu:20.04）—— 直接 apt-get，我们就是 root
+      #   * 万一容器不可用、降级到宿主机 —— 需要 sudo
+      # 用 sudo -n true 探测，两套都覆盖，这样"容器挂掉"不会让整个 CI 变红。
       - name: 安装 32 位编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo dpkg --add-architecture i386 || true
-          sudo apt-get update
-          sudo apt-get install -y g++ g++-multilib make file zip
+          set -e
+          if sudo -n true 2>/dev/null; then SUDO="sudo"; else SUDO=""; fi
+          $SUDO dpkg --add-architecture i386 2>/dev/null || true
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
+            g++ g++-multilib make file zip binutils ca-certificates
+          # 确认 32 位目标可用（多架构头文件位于 /usr/include/i386-linux-gnu）
+          test -d /usr/include/i386-linux-gnu || echo "警告: 没找到 i386 头文件目录"
 
-      - name: 显示工具链版本
-        run: g++ --version
+      - name: 显示工具链与 glibc 版本
+        run: |
+          g++ --version | head -1
+          echo "编译机 glibc: $(ldd --version | head -1)"
 
-      # ---- 编译插件 ----
       - name: 编译 perfstat.so
         run: make
 
@@ -226,6 +254,59 @@ jobs:
           file Release/perfstat.so | grep -q "ELF 32-bit"
           nm -D --defined-only Release/perfstat.so | grep -E "CreateInterface|perfstat_factory"
           echo "产物校验通过：32 位 ELF，导出 CreateInterface / perfstat_factory"
+
+      # ---- 【关键】校验 glibc 版本上限 ----
+      #
+      # 这一步是防回归的核心：只要将来编译机的 glibc 又变新（例如容器忘了固定、
+      # 或换回 ubuntu-latest），这里会立刻失败，而不是等用户装完才发现
+      # "version `GLIBC_2.xx' not found"。
+      #
+      # 原则：产物要求的最高 GLIBC_ 版本必须 <= 目标系统的最低 glibc。
+      #   ubuntu:20.04 编译 -> 要求约 GLIBC_2.28 左右；上限设 2.31 留足余量。
+      - name: 校验 glibc 版本兼容性
+        run: |
+          set -e
+          echo "=== 产物需要的 GLIBC_* 版本 ==="
+          objdump -T Release/perfstat.so | grep -o 'GLIBC_[0-9.]*' | sort -V -u
+          NEED=$(objdump -T Release/perfstat.so | grep -o 'GLIBC_[0-9.]*' | sort -V -u | tail -1)
+          echo "产物最高要求: $NEED"
+
+          # 编译机自己的 glibc 版本 —— 用它当上限。
+          # 这样无论跑在容器里(2.31)还是降级到较新的宿主机，判断都成立，
+          # 而且能精确指出"是不是编译环境变新了"。
+          HOSTV=$(ldd --version | head -1 | grep -o '[0-9]\+\.[0-9]\+$' | head -1)
+          echo "编译机 glibc: $HOSTV"
+          MAX="GLIBC_$HOSTV"
+
+          NEWEST=$(printf '%s\n%s\n' "$NEED" "$MAX" | sort -V | tail -1)
+          if [ "$NEWEST" != "$MAX" ] && [ "$NEED" != "$MAX" ]; then
+            echo "::error::产物要求 $NEED，比编译机自身的 $MAX 还新 —— 这不可能，说明解析出错"
+            exit 1
+          fi
+
+          # 真正要防的是"编译机太新"：容器固定为 ubuntu:20.04(glibc 2.31)，
+          # 一旦它失效/被改成更新的镜像，这里会立刻报警。
+          LIMIT=2.31
+          OVER=$(printf '%s\n%s\n' "$HOSTV" "$LIMIT" | sort -V | tail -1)
+          if [ "$HOSTV" != "$LIMIT" ] && [ "$OVER" = "$HOSTV" ]; then
+            echo "::error::编译机 glibc 是 $HOSTV，高于预期上限 $LIMIT"
+            echo "::error::这会让产物的 glibc 要求变高，老系统用户会报 version \`GLIBC_x.yz' not found。"
+            echo "::error::请确认 linux job 的 container 仍是 ubuntu:20.04（不要换成更新的镜像）。"
+            exit 1
+          fi
+          echo "OK: 编译机 glibc $HOSTV <= $LIMIT，产物要求 $NEED"
+
+          echo "=== 确认 C++ 运行库已静态链接（应为空）==="
+          CXXVER=$(objdump -T Release/perfstat.so | grep -o -e 'GLIBCXX_[0-9.]*' -e 'CXXABI_[0-9.]*' | sort -u || true)
+          if [ -n "$CXXVER" ]; then
+            echo "::error::产物仍依赖动态 libstdc++：$CXXVER"
+            echo "::error::Makefile 里的 -static-libstdc++ 是不是被去掉了？"
+            exit 1
+          fi
+          echo "OK: 无 GLIBCXX / CXXABI 动态依赖"
+
+          echo "=== 动态库依赖（应只有 libc / ld-linux 之类的基础库）==="
+          objdump -p Release/perfstat.so | grep NEEDED
 
       # ---- 自检 ----
       - name: 编译自检程序

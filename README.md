@@ -1,5 +1,22 @@
 # perfstat —— 服务器进程内 CPU / 内存分析插件（纯引擎插件）
 
+> ## ⚠️ 关于作者与来源：本项目**全部代码与文档均由 AI 生成**
+>
+> **本项目（含全部源码、构建脚本、自检工具、工作流与本 README）完全由 AI 编写，
+> 人类未参与编码。**
+>
+> | | |
+> | --- | --- |
+> | 生成模型 | **DeepSeek-V4.1-Flash** |
+> | 人类参与部分 | **仅提出需求、提供测试环境、反馈问题** |
+>
+> 之所以明确标注：一是**不掠功**（这不是人类手写的代码），二是提醒使用者
+> ——**AI 生成的代码请自行审阅后再上生产环境**。本项目虽然做了大量自检与真机验证
+> （见 [11.7 验证状态](#117-验证状态当前版本实测到哪一步)），但**不提供任何担保**。
+>
+> 如果你发现问题，欢迎提 Issue；把 `perf_selftest` 的输出或
+> `addons/perfstat-out.log` 一起贴上，会好排查很多。
+
 一个**直接由游戏引擎加载**的服务器插件，和 `l4dtoolz` 一样靠 `.vdf` 自动加载：
 
 ```
@@ -879,6 +896,50 @@ left4dead2/addons/perfstat-out.log
 **结论：不管控制台显示与否，`perfstat-out.log` 一定能看到完整输出。**
 如果那里显示 `stdout (兜底)`，说明前两条都不可用，把 `perf_selftest` 的输出发我。
 
+**Q：Linux 上加载失败，日志里写着 `version \`GLIBC_2.36' not found`（我的系统是 Ubuntu 22.04，只有 2.35）？**
+
+完整报错长这样：
+
+```
+failed to dlopen .../addons/perfstat.so error=/lib/i386-linux-gnu/libc.so.6:
+  version `GLIBC_2.36' not found (required by .../addons/perfstat.so)
+```
+
+**根因：glibc 是"向前兼容"的，不是"向后兼容"的。**
+
+- 在**老**系统上编的产物 → 能在**新**系统上跑 ✅
+- 在**新**系统上编的产物 → **不能在老**系统上跑 ❌
+
+gcc 会把"**编译机上能看到的符号版本**"写进产物。GitHub 的 `ubuntu-latest` 现在是
+Ubuntu 24.04（glibc **2.39**），于是编出来的 `.so` 就要求了 `GLIBC_2.36` —— 而
+Ubuntu 22.04 只有 2.35，直接加载失败。
+
+> 注意：`-static-libstdc++`（见下面那条 FAQ）**只解决 libstdc++，解决不了 glibc**。
+> 这是两个完全不同的问题：libstdc++ 可以静态链进去，glibc 基本不能。
+
+**修法（v1.16.0 起，仓库已经这么做）**：Linux job 在**老 glibc 的容器里编译**：
+
+```yaml
+linux:
+  runs-on: ubuntu-latest
+  container: ubuntu:20.04        # glibc 2.31 < Ubuntu 22.04 的 2.35
+```
+
+同时工作流里加了一条**硬性校验**，产物要求的最高 `GLIBC_` 版本一旦超过 `2.31`
+就立刻失败 —— 这样以后谁把镜像改新了、或者容器失效降级到宿主机，CI 会当场报警，
+而不是等用户装完才发现。
+
+**想自己确认产物的 glibc 要求**：
+
+```bash
+objdump -T Release/perfstat.so | grep -o 'GLIBC_[0-9.]*' | sort -V -u
+# 最后一行就是最高要求；容器里编出来应该在 GLIBC_2.28 附近，<= 2.31 即安全
+```
+
+**如果你要自己编译并分发给别人**：请务必在**老系统或容器**里编
+（`docker run --rm -v $PWD:/w -w /w ubuntu:20.04 bash -c`
+`'apt-get update && apt-get install -y g++-multilib make && make'`）。
+
 **Q：Linux 上 `Unable to load plugin "addons/perfstat"`，日志里写着 `GLIBCXX_3.4.29' not found`？**
 
 完整报错长这样：
@@ -1381,6 +1442,10 @@ perfstat-all-platforms.zip  (artifact)
 | `perfstat-linux` | `addons/perfstat.so`、`addons/perfstat.vdf`、`addons/perfstat.ini`、`README.md`、Linux 自检程序与日志 |
 | `perfstat-all-platforms` | 上面两个合并成的总包（一次下载搞定） |
 
+**Linux 任务跑在 `ubuntu:20.04` 容器里**（不是为了"新"，而是为了"够老"）——
+这样编出来的 `.so` glibc 要求足够低，能在 22.04 / 20.04 / Debian 11 等系统上直接用。
+工作流末尾会校验 `objdump -T` 里的最高 `GLIBC_` 版本，超限即失败。
+
 工作流做了这些事：
 
 - **Windows 任务**：准备 32 位 MSVC 环境 → `build_win32.bat` → 用 `dumpbin` 校验产物是
@@ -1454,6 +1519,27 @@ perfstat.cpp (插件入口 / 指令)
 5. **按函数聚合而不是按偏移**：把同一函数内的多个偏移合并成一行，减少噪声
 6. **堆分析**：接引擎的内存分配钩子，才能真正回答"这个插件自己吃了多少内存"
 7. **外部监控工具**：脱离插件、从外部看机器上所有 srcds 实例（需要独立进程 + 权限，是另一个方案）
+
+---
+
+## 附：本项目由 AI 生成（完整声明）
+
+本仓库的**全部内容**——源码（`src/*`）、构建脚本（`Makefile` / `build_win32.bat`）、
+自检工具（`tools/*`）、GitHub Actions 工作流、示例配置与本 README——**均由 AI 生成**。
+
+- **生成模型：DeepSeek-V4.1-Flash**
+- **人类的角色**：提出需求、搭建/提供测试环境（Windows 与 Linux 的 L4D2 专用服务器）、
+  在真机上验证并反馈问题（本 README 里记录的大量"踩坑"就来自这些反馈）
+- **人类未参与编写任何代码或文档**
+
+**给使用者的提醒**：
+
+1. 这是 AI 生成的代码，**请自行审阅后再用于生产环境**。本项目没有任何担保。
+2. 项目**做了较多自我验证**：36 项算法自检、21 项 Windows 加载自检、
+   38 项 Linux 加载自检、12 项 Linux 冒烟测试，以及真机上的完整功能验证
+   （见 [11.7 验证状态](#117-验证状态当前版本实测到哪一步)）。
+   即便如此，**未覆盖的路径依然可能存在缺陷**。
+3. 遇到问题请提 Issue，并附上 `perf_selftest` 的输出（或 `addons/perfstat-out.log`）。
 
 ---
 

@@ -28,8 +28,14 @@ CXXFLAGS  = -m32 -std=c++11 -O2 -fPIC -fno-exceptions -fno-rtti -fno-strict-alia
 #     (gcc 11) 上编译出的 .so 拿到 L4D2 服务端会加载失败：
 #       failed to dlopen perfstat.so error=bin/libstdc++.so.6:
 #         version `GLIBCXX_3.4.29' not found
-#     把 libstdc++ / libgcc 静态链进去，插件就不依赖服务端的 C++ 运行库版本，
-#     在任何发行版上编出来都能直接跑（代价是 .so 稍大一点，完全值得）。
+#     把 libstdc++ / libgcc 静态链进去，插件就不依赖服务端的 C++ 运行库版本。
+#
+#   ⚠️ 但这【解决不了 glibc】。glibc 基本没法静态链接，而且它是"向前兼容"的：
+#      在老系统上编 -> 能在新系统上跑；在新系统上编 -> 老系统跑不了。
+#      所以【必须在足够老的 glibc 环境里编译】。CI 用 ubuntu:20.04 容器
+#      (glibc 2.31) 就是为此；若直接拿 Ubuntu 24.04 编，产物会要求 GLIBC_2.36，
+#      Ubuntu 22.04 (glibc 2.35) 的用户会直接加载失败。
+#      自检命令：objdump -T Release/perfstat.so | grep -o 'GLIBC_[0-9.]*' | sort -V -u
 LDFLAGS   = -m32 -shared -rdynamic -static-libgcc -static-libstdc++
 LIBS      = -lpthread -ldl -lm
 
