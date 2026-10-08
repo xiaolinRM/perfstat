@@ -925,9 +925,20 @@ linux:
   container: ubuntu:20.04        # glibc 2.31 < Ubuntu 22.04 的 2.35
 ```
 
-同时工作流里加了一条**硬性校验**，产物要求的最高 `GLIBC_` 版本一旦超过 `2.31`
-就立刻失败 —— 这样以后谁把镜像改新了、或者容器失效降级到宿主机，CI 会当场报警，
+同时工作流里加了一条**硬性校验**：编译机的 glibc 一旦超过 `2.31` 就立刻失败 ——
+这样以后谁把镜像改新了、或者容器失效降级到宿主机，CI 会当场报警，
 而不是等用户装完才发现。
+
+**实际效果**（同一份代码，两种编译环境）：
+
+| 编译环境 | 产物最高要求 | 能跑的发行版 |
+| --- | --- | --- |
+| Ubuntu 24.04（glibc 2.39，原 `ubuntu-latest`） | `GLIBC_2.36` | ❌ 22.04 就装不上 |
+| **Ubuntu 20.04 容器（glibc 2.31）** | **`GLIBC_2.17`** | ✅ CentOS 7 / Debian 9+ / Ubuntu 16.04+ |
+
+顺带一提：**降到 2.17 比预期还好**（本来只指望 2.28 左右）。因为换到老环境后，
+那些"新 glibc 才提供的符号"（`memcpy@GLIBC_2.14`、`stat@GLIBC_2.33` 之类）全部
+回退成了老版本，产物反而更干净。
 
 **想自己确认产物的 glibc 要求**：
 
@@ -970,6 +981,37 @@ objdump -T Release/perfstat.so | grep -c GLIBCXX     # 期望：0
 
 > 如果你是**自己手写的编译命令**（没用仓库的 Makefile），务必加上
 > `-static-libstdc++ -static-libgcc`，否则很容易踩这个坑。
+
+**Q：Windows 上有没有类似 Linux glibc 那样的兼容性问题？**
+
+**没有。** Windows 这边不存在"编译机版本决定产物要求"这类问题，原因有三：
+
+**1. Windows 保持长期 ABI 向后兼容。** `kernel32.dll` / `user32.dll` / `ntdll.dll`
+这些系统 DLL 的导出函数在新版本 Windows 上一直保留，老程序照常能跑 ——
+这跟 glibc 的"符号版本"机制完全不同（glibc 会把"编译时可见的版本"烧进产物）。
+
+**2. C 运行库已经静态链接。** 编译用的是 **`/MT`**（静态 CRT），所以 DLL **不依赖
+VC++ 运行库**，用户不需要装什么 `vcredist_x86`。实测产物的导入表里没有
+`vcruntime*.dll` / `msvcrt.dll` / `msvcp*.dll`。
+
+**3. 只依赖必定存在的系统库。** 产物导入的是 `kernel32` / `user32` / `psapi` / `ntdll`
+一类核心 DLL，PE 头里写的最低系统版本是 **6.0（Windows Vista）** ——
+而 L4D2 服务端本身就要求 Win7 以上，所以实际下限远高于这个值。
+
+**唯一需要留意的两点**：
+
+| 事项 | 说明 |
+| --- | --- |
+| **必须是 32 位** | L4D2 的 `srcds.exe` 是 32 位进程，64 位 DLL 加载不进去。源码里有 `static_assert(sizeof(void*) == 4)` 会在编译期拦住 |
+| **不要用高版本 SDK 才有的 API** | 目前已用的都是老 API（如 `AddVectoredExceptionHandler` 是 XP 时代就有、`InitializeCriticalSectionEx` 是 Vista+）。加新功能时要留意别引入 Win8/Win10 才有的函数 |
+
+> 验证方法（`dumpbin` 随 VS 提供）：
+> ```bat
+> dumpbin /dependents build\perfstat.dll     :: 看依赖了哪些 DLL
+> dumpbin /headers  build\perfstat.dll       :: 看 machine (x86) 和最低系统版本
+> ```
+> 期望：只有 `KERNEL32.dll` / `USER32.dll` / `PSAPI.DLL` / `ntdll.dll` 这类，
+> **没有**任何 `vcruntime` / `msvcp`。
 
 **Q：Linux 上 `perfstat.ini` 明明放在 `addons/` 里，插件却说读不到？**
 

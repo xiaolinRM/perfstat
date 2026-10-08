@@ -232,10 +232,37 @@ jobs:
           if sudo -n true 2>/dev/null; then SUDO="sudo"; else SUDO=""; fi
           $SUDO dpkg --add-architecture i386 2>/dev/null || true
           $SUDO apt-get update
+          # 注意：ubuntu 基础镜像【没有 unzip】，而打包步骤要校验 zip 结构。
+          # 一开始漏了它，CI 直接 `unzip: not found` 退出码 127（踩过）。
+          # 现在改用 zip 自带的 zipinfo 做校验（见打包步骤），unzip 仍然装上
+          # 是为了顺手能用、也避免其他地方用到时再踩一次。
           $SUDO apt-get install -y --no-install-recommends \
-            g++ g++-multilib make file zip binutils ca-certificates
+            g++ g++-multilib make file zip unzip binutils ca-certificates
           # 确认 32 位目标可用（多架构头文件位于 /usr/include/i386-linux-gnu）
           test -d /usr/include/i386-linux-gnu || echo "警告: 没找到 i386 头文件目录"
+
+      # ---------------------------------------------------------------------------------
+      # 预检：把后面所有步骤要用到的命令先确认一遍
+      #
+      # 【为什么加这一步】踩过：ubuntu 基础镜像里没有 unzip，而打包步骤要校验 zip ——
+      # 于是"编译、校验、自检全过了"，最后倒在打包，报一个 `unzip: not found` 退出码 127。
+      # 在这里一次性检查，缺什么当场列出来，不用一步步试。
+      # ---------------------------------------------------------------------------------
+      - name: 预检所需命令
+        run: |
+          set -e
+          MISSING=""
+          for c in g++ make file zip zipinfo objdump nm ldd timeout stat; do
+            if ! command -v "$c" >/dev/null 2>&1; then
+              MISSING="$MISSING $c"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::缺少命令:$MISSING"
+            echo "::error::请把对应软件包加进上面的 apt-get install（zipinfo 由 zip 提供）。"
+            exit 1
+          fi
+          echo "预检通过：全部命令可用"
 
       - name: 显示工具链与 glibc 版本
         run: |
@@ -363,22 +390,24 @@ jobs:
           cp build/perfstat_loader_test_linux build/perfstat_smoke_linux dist/perfstat-linux/tests/
           cp build/loader_test_linux.log build/smoke_linux.log           dist/perfstat-linux/tests/
           cd dist && zip -r perfstat-linux.zip perfstat-linux
+          # 【为什么用 zipinfo 而不是 unzip】zipinfo 由 zip 包自带，而 ubuntu 基础
+          # 镜像里没有 unzip —— 之前打包步骤就是因为 `unzip: not found` 直接以
+          # 退出码 127 失败（踩过）。用 zipinfo 就完全没有额外依赖了。
+          # `zipinfo -1` 只列条目名；用 `zipinfo -l` 会把表头也算进去，
+          # 那样 grep '\.zip$' 会误报"嵌套了 zip"。
           echo "--- zip 条目（应只有一层目录，且没有 .zip）---"
-          unzip -l perfstat-linux.zip
-          # 注意：必须用 -Z1（只列条目名）来判断嵌套。
-          # 用 `unzip -l | grep '\.zip$'` 会把第一行 "Archive: perfstat-linux.zip" 也算进去，
-          # 于是永远误报"嵌套了 zip"（踩过）。
-          if unzip -Z1 perfstat-linux.zip | grep -qE '\.zip$'; then
+          zipinfo -l perfstat-linux.zip
+          if zipinfo -1 perfstat-linux.zip | grep -qE '\.zip$'; then
             echo "::error::zip 里嵌套了 zip"
-            unzip -Z1 perfstat-linux.zip | grep -E '\.zip$'
+            zipinfo -1 perfstat-linux.zip | grep -E '\.zip$'
             exit 1
           fi
-          unzip -Z1 perfstat-linux.zip | grep -q 'addons/perfstat.so' || {
+          zipinfo -1 perfstat-linux.zip | grep -q 'addons/perfstat.so' || {
             echo "::error::zip 里没有 addons/perfstat.so"; exit 1; }
-          unzip -Z1 perfstat-linux.zip | grep -q 'addons/perfstat.vdf' || {
+          zipinfo -1 perfstat-linux.zip | grep -q 'addons/perfstat.vdf' || {
             echo "::error::zip 里没有 addons/perfstat.vdf"; exit 1; }
           # 顶层必须只有一个目录（避免又多一层）
-          tops=$(unzip -Z1 perfstat-linux.zip | cut -d/ -f1 | sort -u | wc -l)
+          tops=$(zipinfo -1 perfstat-linux.zip | cut -d/ -f1 | sort -u | wc -l)
           echo "顶层条目数: $tops"
           test "$tops" = "1" || { echo "::error::zip 顶层不止一个条目"; exit 1; }
           # 注意：上面已经 cd 进 dist 了，这里只能 ls 当前目录。
